@@ -1,11 +1,10 @@
 import { NextResponse } from 'next/server';
 import dbConnect from '@/lib/dbConnect';
-import Patient from '@/models/Patient';
-import Appointment from '@/models/Appointment';
-import Consultation from '@/models/Consultation';
-import Prescription from '@/models/Prescription';
-import FollowUp from '@/models/FollowUp';
-import { PatientSchema } from '@/lib/validators';
+import { getPatientById, updatePatient, softDeletePatient } from '@/lib/db/repositories/patientRepository';
+import { listAppointments } from '@/lib/db/repositories/appointmentRepository';
+import { listConsultations } from '@/lib/db/repositories/consultationRepository';
+import { listPrescriptions } from '@/lib/db/repositories/prescriptionRepository';
+import { listFollowUps } from '@/lib/db/repositories/followUpRepository';
 import { authorizeUser } from '@/lib/permissions';
 
 // GET /api/patients/[patientId] - Get patient detail with related clinical history
@@ -21,11 +20,7 @@ export async function GET(
     const id = patientId;
     await dbConnect();
 
-    // Query by patientId (PX-XXXX) or _id
-    const patient = await Patient.findOne({
-      $or: [{ patientId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
-    }).lean();
-
+    const patient = await getPatientById(id);
     if (!patient) {
       return NextResponse.json(
         { success: false, error: 'Patient not found' },
@@ -33,12 +28,12 @@ export async function GET(
       );
     }
 
-    // Fetch related records
+    // Fetch related records (all clinical history preserved)
     const [appointments, consultations, prescriptions, followUps] = await Promise.all([
-      Appointment.find({ patientId: patient.patientId }).sort({ appointmentDate: -1 }).lean(),
-      Consultation.find({ patientId: patient.patientId }).sort({ consultationDate: -1 }).lean(),
-      Prescription.find({ patientId: patient.patientId }).sort({ prescriptionDate: -1 }).lean(),
-      FollowUp.find({ patientId: patient.patientId }).sort({ followUpDate: -1 }).lean(),
+      listAppointments({ patientId: patient.patientId }),
+      listConsultations({ patientId: patient.patientId }),
+      listPrescriptions({ patientId: patient.patientId }),
+      listFollowUps({ patientId: patient.patientId }),
     ]);
 
     const formattedPatient = {
@@ -79,24 +74,21 @@ export async function PUT(
     await dbConnect();
     const body = await req.json();
 
-    const patient = await Patient.findOne({
-      $or: [{ patientId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
+    const updated = await updatePatient(id, {
+      ...body,
+      updatedBy: auth.user?.userId || 'STAFF',
     });
 
-    if (!patient) {
+    if (!updated) {
       return NextResponse.json(
         { success: false, error: 'Patient not found' },
         { status: 404 }
       );
     }
 
-    // Update allowed fields
-    Object.assign(patient, body);
-    await patient.save();
-
     const formatted = {
-      ...patient.toObject(),
-      id: patient.patientId,
+      ...updated,
+      id: updated.patientId,
     };
 
     return NextResponse.json({
@@ -113,7 +105,7 @@ export async function PUT(
   }
 }
 
-// DELETE /api/patients/[patientId] - Delete patient record
+// DELETE /api/patients/[patientId] - Soft delete patient record (preserves clinical & billing records)
 export async function DELETE(
   req: Request,
   { params }: { params: Promise<{ patientId: string }> }
@@ -126,9 +118,8 @@ export async function DELETE(
     const id = patientId;
     await dbConnect();
 
-    const patient = await Patient.findOneAndDelete({
-      $or: [{ patientId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
-    });
+    // SOFT DELETION: deactivates patient without deleting clinical records, prescriptions, or billing history
+    const patient = await softDeletePatient(id, auth.user?.userId || 'ADMIN');
 
     if (!patient) {
       return NextResponse.json(
@@ -139,13 +130,14 @@ export async function DELETE(
 
     return NextResponse.json({
       success: true,
-      message: `Patient ${patient.fullName} (${patient.patientId}) deleted successfully.`,
+      message: `Patient ${patient.fullName} (${patient.patientId}) deactivated successfully. All clinical and financial history preserved.`,
     });
   } catch (error: any) {
-    console.error('Error deleting patient:', error);
+    console.error('Error deactivating patient:', error);
     return NextResponse.json(
-      { success: false, error: 'Failed to delete patient record.' },
+      { success: false, error: 'Failed to deactivate patient record.' },
       { status: 500 }
     );
   }
 }
+

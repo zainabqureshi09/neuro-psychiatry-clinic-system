@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
 import dbConnect from '@/lib/dbConnect';
-import Patient from '@/models/Patient';
 import { PatientSchema } from '@/lib/validators';
 import { authorizeUser } from '@/lib/permissions';
+import { listPatients, createPatient } from '@/lib/db/repositories/patientRepository';
 
 // GET /api/patients - Search & list paginated patients
 export async function GET(req: Request) {
@@ -18,48 +18,22 @@ export async function GET(req: Request) {
     const page = parseInt(searchParams.get('page') || '1', 10);
     const limit = parseInt(searchParams.get('limit') || '50', 10);
 
-    const filter: any = {};
-
-    if (query.trim()) {
-      const regex = new RegExp(query.trim(), 'i');
-      filter.$or = [
-        { patientId: regex },
-        { fullName: regex },
-        { phone: regex },
-      ];
-    }
-
-    if (gender !== 'All') {
-      filter.gender = gender;
-    }
-
-    if (status !== 'All') {
-      filter.status = status;
-    }
-
-    const skip = (page - 1) * limit;
-    const [patients, total] = await Promise.all([
-      Patient.find(filter)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Patient.countDocuments(filter),
-    ]);
-
-    const formattedPatients = patients.map(p => ({
-      ...p,
-      id: p.patientId,
-    }));
+    const result = await listPatients({
+      search: query,
+      gender,
+      status,
+      page,
+      limit,
+    });
 
     return NextResponse.json({
       success: true,
-      data: formattedPatients,
+      data: result.data,
       pagination: {
-        total,
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit) || 1,
+        total: result.total,
+        page: result.page,
+        limit: result.limit,
+        totalPages: Math.ceil(result.total / result.limit) || 1,
       },
     });
   } catch (error: any) {
@@ -89,47 +63,11 @@ export async function POST(req: Request) {
     }
 
     const patientData = validation.data;
-
-    // Generate unique patientId (PX-XXXX)
-    let patientId = '';
-    let isUnique = false;
-    let attempts = 0;
-
-    while (!isUnique && attempts < 10) {
-      attempts++;
-      const count = await Patient.countDocuments();
-      const randomNum = Math.floor(9400 + count + attempts);
-      patientId = `PX-${randomNum}`;
-      const existing = await Patient.findOne({ patientId });
-      if (!existing) {
-        isUnique = true;
-      }
-    }
-
-    if (!isUnique) {
-      patientId = `PX-${Date.now().toString().slice(-4)}`;
-    }
-
-    const todayStr = new Date().toISOString().split('T')[0];
-
-    const newPatient = new Patient({
-      ...patientData,
-      patientId,
-      registeredDate: patientData.registeredDate || todayStr,
-      lastVisitDate: patientData.lastVisitDate || 'N/A',
-      nextFollowUpDate: patientData.nextFollowUpDate || 'N/A',
-    });
-
-    await newPatient.save();
-
-    const responseData = {
-      ...newPatient.toObject(),
-      id: newPatient.patientId,
-    };
+    const newPatient = await createPatient(patientData, auth.user?.userId || 'SYSTEM');
 
     return NextResponse.json({
       success: true,
-      data: responseData,
+      data: newPatient,
       message: `Patient ${newPatient.fullName} registered successfully with ID ${newPatient.patientId}`,
     });
   } catch (error: any) {
@@ -140,3 +78,4 @@ export async function POST(req: Request) {
     );
   }
 }
+
