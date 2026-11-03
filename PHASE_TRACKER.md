@@ -1,0 +1,188 @@
+# NPCS EMR — Phase Tracker & Deployment Record
+
+**Project:** NPCS – Neuropsychiatric & Clinical Practice System
+**Purpose:** Single source of truth for what is done, what is pending, and what must never be touched.
+**Last updated:** 2026-11-03
+
+---
+
+## 1. Ground rules (agreed with the owner)
+
+| # | Rule | Status |
+|---|---|---|
+| R1 | Do not delete or overwrite existing patient data | Enforced |
+| R2 | Do not drop MongoDB collections or migrate MongoDB data (yet) | Enforced |
+| R3 | Do not assume Supabase credentials are valid — verify | Enforced |
+| R4 | Never expose DB credentials or service-role keys (never in chat, never in git) | Enforced |
+| R5 | Do not deploy untested code | Enforced |
+| R6 | Do not change the existing UI unnecessarily | Enforced |
+| R7 | Do not remove existing features without explicit owner approval | Enforced |
+| R8 | Git checkpoint + backup before any change | Done (see §5) |
+| R9 | No VPS access / no deployment until the owner explicitly approves | Enforced |
+
+**Approval gate:** live deployment requires owner sign-off after Phases 2–4 pass against
+the real Supabase project.
+
+---
+
+## 2. Infrastructure (as supplied by the owner)
+
+| Item | Value |
+|---|---|
+| Hosting | Contabo — Cloud VPS 4 |
+| OS | Ubuntu 24.04 |
+| IP | `<VPS_PUBLIC_IP>` *(redacted)* (**not accessed**) |
+| Frontend | Next.js 16.3.4 |
+| Backend | Node.js + Express 5.2.1 |
+| Database | Supabase PostgreSQL (**project does not exist yet**) |
+| Process manager | PM2 |
+| Reverse proxy | Nginx |
+| SSL | Let's Encrypt / Certbot |
+| Production domain | ❓ **Unresolved** — `nginx/emr.conf` says `emr.yourclinicdomain.com`; CORS defaults say `npcs.digital` |
+
+---
+
+## 3. Phase status
+
+| Phase | Description | Status |
+|---|---|---|
+| **0** | Audit, source backup, Git checkpoint | ✅ **Complete** |
+| **1** | Schema security hardening (RLS, grants, FK integrity) + production secret guard | ✅ **Complete** |
+| **S** | Provision a new Supabase project and connect it | 🔄 **In progress** |
+| **2** | Connect app to Supabase, validate credentials, transactional pool, env templates | ⏳ Blocked by Phase S |
+| **3** | Read-only MongoDB → PostgreSQL data migration (MongoDB preserved) | ⏳ Not started (needs approval) |
+| **4** | Live integration tests against real Supabase | ⏳ Not started |
+| **5** | VPS deployment (PM2, Nginx, Certbot, UFW, pg_dump backups) | ⛔ **Not approved** |
+
+---
+
+## 4. Completed work in detail
+
+### Phase 0 — Audit & checkpoint ✅
+
+* Full architecture audit: 27 Next.js route handlers, 12 Express route modules, 14 repositories.
+* Verified the configured Supabase host `<old-project-ref>.supabase.co` returns **NXDOMAIN**
+  from the local resolver, Google DoH, and Cloudflare DoH (control domain `supabase.co`
+  resolves correctly) → **the project does not exist; the migration was never live.**
+* Confirmed 13 Mongoose models ↔ 13 PostgreSQL tables.
+* Baseline gates: `tsc --noEmit` ✅ · `eslint` ✅ · `next build` ✅ · `test:postgres` **39/39** ✅.
+* Source backup: `…/backups/npcs-source-20261103-234956.tar.gz` (2.36 MB).
+* Git checkpoint commit + annotated tag `pre-supabase-integration`.
+* Added `scratch/` and `scratch2_*.txt` to `.gitignore` so debug dumps are never committed.
+
+### Phase 1 — Security hardening ✅
+
+New migration: `supabase/migrations/20261103000001_npcs_rls_and_integrity_hardening.sql`
+
+* Enabled Row Level Security on all 13 tables (previously **0 of 13**). With no policies
+  this is deny-by-default for the public API roles.
+* Revoked `anon` and `authenticated` privileges on all public-schema tables, sequences and
+  functions; revoked `USAGE` on schema `public` from `anon`.
+* `ALTER DEFAULT PRIVILEGES` so future tables are not auto-exposed.
+* Changed 3 foreign keys from `ON DELETE CASCADE` → `ON DELETE RESTRICT`
+  (`clinical_records`, `appointments`, `follow_ups` → `patients`).
+* Self-verifying `DO` block that raises an exception if any table is left unprotected.
+* `lib/auth.ts`: production now rejects a missing/short/placeholder `SESSION_SECRET`
+  (previously it silently fell back to a hardcoded development string).
+* `scripts/validateSchema.ts` extended with a **54-check** offline validator
+  (`npm run validate:schema`).
+* No table dropped, no row deleted, no UI or feature changed.
+
+**Why RLS mattered:** Supabase publishes every `public` table over its REST API, and
+`NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` ships to the browser. With RLS disabled, anyone
+holding that key could read/write every patient, consultation, prescription and payment
+while bypassing the app's JWT + RBAC. The server is unaffected by the fix because the
+secret key maps to `service_role`, which bypasses RLS.
+
+---
+
+## 5. Change log
+
+| Commit | Tag | Summary |
+|---|---|---|
+| `a27ebc0` | `pre-supabase-integration` | Checkpoint: PostgreSQL repository layer, RBAC, audit, offline suite (66 files) |
+| `5d8df01` | — | Security: RLS + revokes + FK hardening + production secret guard |
+
+Rollback: `git reset --hard pre-supabase-integration`
+
+---
+
+## 6. Verified migration inventory
+
+Measured by mechanically stripping SQL comments (`scratch/audit-sql.js`), not estimated.
+
+### File 1 — `20261026000001_initial_npcs_schema.sql` (635 lines)
+
+| Objects created | Count |
+|---|---|
+| Tables (`CREATE TABLE IF NOT EXISTS`) | **13** |
+| Indexes (`CREATE INDEX IF NOT EXISTS`) | **34** |
+| Triggers | **15** |
+| Functions | **5** |
+| Extensions | **2** (`uuid-ossp`, `pgcrypto`) |
+| Seed rows | **1** (`clinic_settings`, singleton `id = 1`, `ON CONFLICT DO NOTHING`) |
+
+**Destructive statements: NONE**
+(`DROP TABLE` 0 · `DROP COLUMN` 0 · `TRUNCATE` 0 · `DELETE FROM` 0 · `ALTER COLUMN TYPE` 0)
+
+⚠️ Runs **without** a `BEGIN/COMMIT` wrapper, and its `CREATE TRIGGER` statements have no
+`IF NOT EXISTS` → **apply this file exactly once, to a brand-new empty project.**
+Re-running would fail at the first trigger (`already exists`), though no data would be lost.
+
+### File 2 — `20261103000001_npcs_rls_and_integrity_hardening.sql` (259 lines)
+
+| Action | Count |
+|---|---|
+| `ENABLE ROW LEVEL SECURITY` | **13** (one per table) |
+| `REVOKE` statements | **13** (7 direct + 6 via default privileges) |
+| `ALTER DEFAULT PRIVILEGES` | **6** |
+| `ALTER TABLE … DROP CONSTRAINT IF EXISTS` | **3** |
+| `ALTER TABLE … ADD CONSTRAINT` (`ON DELETE RESTRICT`) | **3** |
+| `FORCE ROW LEVEL SECURITY` | **0 active** (13 lines intentionally commented out) |
+
+**Destructive statements: NONE.** Wrapped in `BEGIN … COMMIT` → **safe to re-run.**
+Includes pre-check and post-check queries plus a commented rollback block.
+
+> **Correction to the Phase 1 report:** the index count is **34**, not 46 (my earlier figure
+> was an estimate from a mixed grep). Table, trigger and function counts were verified.
+
+---
+
+## 7. Pending tasks & open decisions
+
+| # | Item | Owner | Blocked by |
+|---|---|---|---|
+| P1 | Create the new Supabase project | Owner | — |
+| P2 | Apply File 1 then File 2 in the SQL Editor | Owner | P1 |
+| P3 | Store project URL + keys in `.env.local` (never in chat/git) | Owner | P1 |
+| P4 | Confirm production domain + SSH access | Owner | — |
+| P5 | Decide authoritative API surface (Nginx sends all `/api/` to Express; 27 Next handlers become dead in prod) | Owner | — |
+| P6 | Remove `app/supabase-test/page.tsx` + unused `utils/supabase/*` helpers | Needs owner OK | — |
+| P7 | `DATABASE_URL` (Session pooler) for atomic payments/booking/cascades | Agent | P3 |
+| P8 | Rewrite `.env.production.example` as Supabase-first | Agent | P3 |
+| P9 | Read-only MongoDB → PostgreSQL migration tool | Agent | Phase 4 |
+| P10 | Supabase backup/PITR runbook + `pg_dump` cron | Agent | VPS approval |
+| P11 | Create `/var/log/emr` on the VPS for PM2 | Agent | VPS approval |
+
+---
+
+## 8. Known risks (tracked)
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| Patient records hidden if provider switches before data migration | 🔴 High | Phase 3 runs before any cutover; MongoDB kept intact |
+| Non-atomic writes while `DATABASE_URL` is unset | 🟠 High | P7 adds the `pg` pool |
+| Public Supabase REST access to clinical tables | 🔴 High | **Fixed** in Phase 1 (RLS + revokes) |
+| Dual API surfaces drifting apart | 🟡 Medium | Shared repository layer; P5 decision pending |
+| Deployment docs / backup scripts still MongoDB-only | 🟡 Medium | P8 / P10 |
+
+---
+
+## 9. What has NOT been done (explicit)
+
+* No Supabase project created, connected, or queried.
+* No SQL executed against any database.
+* No MongoDB collection read, written, migrated, or dropped.
+* No VPS login, no PM2, no Nginx, no Certbot, no firewall change.
+* No application code, UI, or feature removed.
+
