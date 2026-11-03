@@ -64,6 +64,13 @@ the real Supabase project.
 * Verified the configured Supabase host `<old-project-ref>.supabase.co` returns **NXDOMAIN**
   from the local resolver, Google DoH, and Cloudflare DoH (control domain `supabase.co`
   resolves correctly) → **the project does not exist; the migration was never live.**
+* **Correction to the Phase 0 report (measured 2026-11-03):** the application does **not**
+  fall back to MongoDB. `getDatabaseConfig()` selects `postgres` whenever `SUPABASE_URL` and a
+  format-valid secret are present — the *dead* host still satisfies that check — so
+  `ensureDatabaseReady()` fails its DNS pre-flight and every data API returns **503**.
+  The earlier statement "running in MongoDB fallback mode" was wrong. Verified with
+  `scratch/check-provider.ts`: `provider = postgres`, `mongoConfigured = true` but **unused**.
+  MongoDB is used only when the Supabase keys are removed or `DB_PROVIDER=mongodb` is set.
 * Confirmed 13 Mongoose models ↔ 13 PostgreSQL tables.
 * Baseline gates: `tsc --noEmit` ✅ · `eslint` ✅ · `next build` ✅ · `test:postgres` **39/39** ✅.
 * Source backup: `…/backups/npcs-source-20261103-234956.tar.gz` (2.36 MB).
@@ -112,6 +119,10 @@ Access values live only in the git-ignored `.env.local`.
 runs, those tables are readable through the public REST API by anyone holding the
 publishable key. Both files must be applied back-to-back, and **no real patient data may be
 loaded before File 2 completes.**
+
+**Step order (revised):** migrations are applied **before** `.env.local` is repointed.
+The SQL Editor runs independently of the app, so doing it first avoids a window in which the
+app is switched to PostgreSQL but the tables do not exist yet.
 
 **Configuration trap:** the provider switches to PostgreSQL as soon as `SUPABASE_URL` and a
 format-valid `SUPABASE_SECRET_KEY` are both present. If the new URL is paired with the *old*
