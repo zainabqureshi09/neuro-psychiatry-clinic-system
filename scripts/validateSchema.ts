@@ -8,6 +8,27 @@ import path from 'path';
  */
 
 const SQL_FILE_PATH = path.resolve(__dirname, '../supabase/migrations/20261026000001_initial_npcs_schema.sql');
+const HARDENING_SQL_PATH = path.resolve(
+  __dirname,
+  '../supabase/migrations/20261103000001_npcs_rls_and_integrity_hardening.sql'
+);
+
+/**
+ * Removes `--` line comments so that assertions only match executable SQL.
+ * Without this, a commented-out statement (such as the opt-in FORCE RLS block)
+ * would be mistaken for live SQL.
+ *
+ * NOTE: `[^\r\n]*` is used instead of `.*` on purpose. This repository has CRLF
+ * line endings on Windows, and `.` does not match `\r` in JavaScript, so
+ * `/--.*$/` silently fails to strip comments on a CRLF file.
+ */
+function stripSqlComments(sql: string): string {
+  return sql
+    .split('\n')
+    .map((line) => line.replace(/--[^\r\n]*/g, ''))
+    .join('\n');
+}
+
 
 const EXPECTED_TABLES = [
   'users',
@@ -188,6 +209,78 @@ function runValidation() {
       passedChecks++;
     }
   }
+
+  // 4. Row Level Security Hardening Verification
+  console.log('\n--- 4. Row Level Security Hardening ---');
+  if (!fs.existsSync(HARDENING_SQL_PATH)) {
+    totalChecks++;
+    console.error(`  ❌ Hardening migration not found: ${path.basename(HARDENING_SQL_PATH)}`);
+  } else {
+    const hardeningSql = stripSqlComments(fs.readFileSync(HARDENING_SQL_PATH, 'utf-8'));
+
+    for (const table of EXPECTED_TABLES) {
+      totalChecks++;
+      const rlsRegex = new RegExp(
+        `ALTER\\s+TABLE\\s+(IF\\s+EXISTS\\s+)?${table}\\s+ENABLE\\s+ROW\\s+LEVEL\\s+SECURITY`,
+        'i'
+      );
+      if (rlsRegex.test(hardeningSql)) {
+        console.log(`  ✅ RLS enabled on '${table}'.`);
+        passedChecks++;
+      } else {
+        console.error(
+          `  ❌ RLS is NOT enabled on '${table}' - clinical data would be readable through the public REST API.`
+        );
+      }
+    }
+
+    totalChecks++;
+    if (/REVOKE\s+ALL\s+ON\s+ALL\s+TABLES\s+IN\s+SCHEMA\s+public\s+FROM\s+anon/i.test(hardeningSql)) {
+      console.log('  ✅ Public-schema table privileges revoked from role anon.');
+      passedChecks++;
+    } else {
+      console.error('  ❌ anon table privileges were not revoked.');
+    }
+
+    totalChecks++;
+    if (/REVOKE\s+ALL\s+ON\s+ALL\s+TABLES\s+IN\s+SCHEMA\s+public\s+FROM\s+authenticated/i.test(hardeningSql)) {
+      console.log('  ✅ Public-schema table privileges revoked from role authenticated.');
+      passedChecks++;
+    } else {
+      console.error('  ❌ authenticated table privileges were not revoked.');
+    }
+
+    for (const table of ['clinical_records', 'appointments', 'follow_ups']) {
+      totalChecks++;
+      const restrictRegex = new RegExp(
+        `ALTER\\s+TABLE\\s+${table}\\s+ADD\\s+CONSTRAINT\\s+${table}_patient_id_fkey[\\s\\S]*?ON\\s+DELETE\\s+RESTRICT`,
+        'i'
+      );
+      if (restrictRegex.test(hardeningSql)) {
+        console.log(`  ✅ '${table}' can no longer cascade-delete patient history (ON DELETE RESTRICT).`);
+        passedChecks++;
+      } else {
+        console.error(`  ❌ '${table}' still cascades on patient delete.`);
+      }
+    }
+
+    totalChecks++;
+    if (!/DISABLE\s+ROW\s+LEVEL\s+SECURITY/i.test(hardeningSql)) {
+      console.log('  ✅ No executable statement leaves a table without RLS.');
+      passedChecks++;
+    } else {
+      console.error('  ❌ The hardening migration contains an executable DISABLE ROW LEVEL SECURITY statement.');
+    }
+
+    totalChecks++;
+    if (!/ALTER\s+TABLE\s+\w+\s+FORCE\s+ROW\s+LEVEL\s+SECURITY/i.test(hardeningSql)) {
+      console.log('  ✅ FORCE RLS left opt-in (safe for connections without BYPASSRLS).');
+      passedChecks++;
+    } else {
+      console.error('  ❌ FORCE ROW LEVEL SECURITY is active - confirm the connection role holds BYPASSRLS.');
+    }
+  }
+
 
   console.log('\n====================================================================');
   console.log(`📊 Validation Summary: ${passedChecks} / ${totalChecks} checks passed (100%)`);

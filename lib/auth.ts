@@ -5,13 +5,36 @@ import { UserRole } from '@/models/User';
 
 const COOKIE_NAME = 'psychiatrist_session';
 
+/** Insecure placeholder secrets that must never be accepted in production. */
+const PLACEHOLDER_SECRET_MARKERS = ['psychiatrist_system_secure', 'your-32-character', 'your_secure'];
+
 /**
  * Resolves the signing secret lazily so that tests and runtime environment
  * changes are always respected (and production misconfiguration is caught).
+ *
+ * Mirrors backend/utils/authUtils.ts: in production a real secret is mandatory.
+ * Failing loudly is intentional - silently signing sessions with a hardcoded
+ * development secret would let anyone forge an ADMIN token.
  */
 function getSecretKey(): Uint8Array {
-  const secret = process.env.SESSION_SECRET || 'psychiatrist_system_secure_jwt_session_secret_32chars_min';
-  return new TextEncoder().encode(secret);
+  const secret = process.env.SESSION_SECRET || process.env.JWT_SECRET;
+  const isProd = process.env.NODE_ENV === 'production';
+
+  if (isProd) {
+    const isUsable =
+      Boolean(secret) &&
+      secret!.length >= 32 &&
+      !PLACEHOLDER_SECRET_MARKERS.some((marker) => secret!.includes(marker));
+
+    if (!isUsable) {
+      throw new Error(
+        'FATAL SECURITY ERROR: SESSION_SECRET must be a unique value of at least 32 characters in production.'
+      );
+    }
+  }
+
+  const activeSecret = secret || 'psychiatrist_system_secure_jwt_session_secret_32chars_min';
+  return new TextEncoder().encode(activeSecret);
 }
 
 export interface SessionPayload {
