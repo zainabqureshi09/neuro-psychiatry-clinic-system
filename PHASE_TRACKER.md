@@ -109,7 +109,7 @@ secret key maps to `service_role`, which bypasses RLS.
 | Project live | ✅ `GET /auth/v1/health` → **HTTP 200** |
 | Publishable key valid | ✅ Accepted by PostgREST (otherwise HTTP 401) |
 | `public` schema state | ✅ **Empty** — `GET /rest/v1/patients` → `PGRST205` "Could not find the table" |
-| Migrations applied | ⛔ None yet (by design) |
+| Migrations applied | ⛔ None yet — re-verified 2026-11-03 via REST probe (`patients` and `clinic_settings` both `PGRST205`) |
 | Secret key installed | ⛔ Pending (must never be shared in chat) |
 
 The old host `<old-project-ref>.supabase.co` remains dead; the new project replaces it.
