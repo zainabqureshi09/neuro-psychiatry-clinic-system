@@ -1,6 +1,10 @@
 import { getSupabaseClient } from '../supabase';
 import { mapConsultationFromPg } from '../mapper';
+import { withTransaction, getPostgresPool } from '../postgres';
 import Consultation, { IConsultation } from '@/models/Consultation';
+import { createPrescription, PrescriptionRecord } from './prescriptionRepository';
+import { createFollowUp, deriveFollowUpStatus, FollowUpRecord } from './followUpRepository';
+import { updatePatient } from './patientRepository';
 
 export interface ConsultationRecord {
   id: string;
@@ -238,6 +242,19 @@ export async function updateConsultation(
     ...obj,
     id: obj.consultationId || obj._id?.toString(),
   } as ConsultationRecord;
+}
+
+/**
+ * Fetches a consultation scoped to a specific patient chart.
+ * Prevents cross-chart record disclosure on nested patient routes.
+ */
+export async function getConsultationByIdForPatient(
+  id: string,
+  patientId: string
+): Promise<ConsultationRecord | null> {
+  const record = await getConsultationById(id);
+  if (!record) return null;
+  return record.patientId === patientId ? record : null;
 }
 
 export async function deleteConsultation(id: string): Promise<boolean> {

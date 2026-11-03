@@ -1,7 +1,12 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import Consultation from '@/models/Consultation';
+﻿import { NextResponse } from 'next/server';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import {
+  getConsultationById,
+  updateConsultation,
+} from '@/lib/db/repositories/consultationRepository';
+import { auditFromSession } from '@/lib/audit';
 
 // GET /api/consultations/[id]
 export async function GET(
@@ -9,15 +14,13 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { id } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
 
-    const consultation = await Consultation.findOne({
-      $or: [{ consultationId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
-    }).lean();
+    const consultation = await getConsultationById(id);
 
     if (!consultation) {
       return NextResponse.json(
@@ -35,10 +38,12 @@ export async function GET(
       },
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to fetch consultation details.' },
-      { status: 500 }
+    console.error('Error fetching consultation:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to fetch consultation details.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
@@ -48,16 +53,21 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR']);
+    const auth = await authorizeUser(['DOCTOR'], req);
     if (!auth.authorized) return auth.response!;
 
     const { id } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
-    const consultation = await Consultation.findOne({
-      $or: [{ consultationId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
-    });
+    // Identifiers are immutable; only clinical content may change.
+    delete body.id;
+    delete body._id;
+    delete body.consultationId;
+    delete body.patientId;
+    delete body.createdAt;
+
+    const consultation = await updateConsultation(id, body);
 
     if (!consultation) {
       return NextResponse.json(
@@ -66,22 +76,30 @@ export async function PUT(
       );
     }
 
-    Object.assign(consultation, body);
-    await consultation.save();
+    await auditFromSession(auth.session, {
+      action: 'UPDATE',
+      module: 'CONSULTATIONS',
+      resourceType: 'CONSULTATION',
+      resourceId: consultation.consultationId,
+      patientRef: consultation.patientId,
+      description: `Updated consultation ${consultation.consultationId}`,
+    });
 
     return NextResponse.json({
       success: true,
       data: {
-        ...consultation.toObject(),
+        ...consultation,
         id: consultation.consultationId,
         date: consultation.consultationDate,
       },
       message: 'Consultation record updated successfully.',
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to update consultation record.' },
-      { status: 500 }
+    console.error('Error updating consultation:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to update consultation record.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

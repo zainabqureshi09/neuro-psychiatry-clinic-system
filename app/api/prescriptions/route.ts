@@ -1,55 +1,57 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import Prescription from '@/models/Prescription';
-import Patient from '@/models/Patient';
-import ClinicSettings from '@/models/ClinicSettings';
+﻿import { NextResponse } from 'next/server';
 import { PrescriptionSchema } from '@/lib/validators';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import { listPrescriptions, createPrescription } from '@/lib/db/repositories/prescriptionRepository';
+import { getPatientById } from '@/lib/db/repositories/patientRepository';
+import { getClinicSettings } from '@/lib/db/repositories/settingsRepository';
+import { auditFromSession } from '@/lib/audit';
+
+function formatPrescription(prescription: any) {
+  return {
+    ...prescription,
+    id: prescription.prescriptionId,
+    dateIssued: prescription.prescriptionDate,
+    treatmentNotes: prescription.treatmentPlan || prescription.treatmentNotes,
+  };
+}
 
 // GET /api/prescriptions
 export async function GET(req: Request) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
-    await dbConnect();
+    await ensureDatabaseReady();
     const { searchParams } = new URL(req.url);
     const patientId = searchParams.get('patientId');
 
-    const filter: any = {};
-    if (patientId) filter.patientId = patientId;
-
-    const prescriptions = await Prescription.find(filter)
-      .sort({ prescriptionDate: -1 })
-      .lean();
-
-    const formatted = prescriptions.map(p => ({
-      ...p,
-      id: p.prescriptionId,
-      dateIssued: p.prescriptionDate,
-      treatmentNotes: p.treatmentPlan || p.treatmentNotes,
-    }));
+    const prescriptions = await listPrescriptions({
+      patientId: patientId || undefined,
+    });
 
     return NextResponse.json({
       success: true,
-      data: formatted,
+      data: prescriptions.map(formatPrescription),
     });
   } catch (error: any) {
     console.error('Error fetching prescriptions:', error);
-    return NextResponse.json(
-      { success: false, error: 'Database error fetching prescriptions.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Database error fetching prescriptions.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
 // POST /api/prescriptions - Generate standalone prescription
 export async function POST(req: Request) {
   try {
-    const auth = await authorizeUser(['DOCTOR']);
+    const auth = await authorizeUser(['DOCTOR'], req);
     if (!auth.authorized) return auth.response!;
 
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
     if (body.dateIssued && !body.prescriptionDate) body.prescriptionDate = body.dateIssued;
@@ -66,7 +68,7 @@ export async function POST(req: Request) {
     const rxData = validation.data;
 
     // Validate Patient
-    const patient = await Patient.findOne({ patientId: rxData.patientId });
+    const patient = await getPatientById(rxData.patientId);
     if (!patient) {
       return NextResponse.json(
         { success: false, error: `Patient ${rxData.patientId} not found.` },
@@ -74,39 +76,37 @@ export async function POST(req: Request) {
       );
     }
 
-    const settings = await ClinicSettings.findOne();
-    const count = await Prescription.countDocuments();
-    const prescriptionId = `RX-${900 + count + 1}`;
+    const settings = await getClinicSettings();
 
-    const newPrescription = new Prescription({
+    const created = await createPrescription({
       ...rxData,
-      prescriptionId,
+      patientId: patient.patientId,
       patientName: patient.fullName,
       patientAge: patient.age,
       patientGender: patient.gender,
+      doctorId: rxData.doctorId || auth.session?.userId || 'USR-001',
+      doctorName: rxData.doctorName || auth.session?.name || 'DR SHAHAB MUHAMMAD',
+      doctorLicense: rxData.doctorLicense || settings.licenseNumber || 'NY-MED-849201',
       prescriptionDate: rxData.prescriptionDate || rxData.dateIssued || new Date().toISOString().split('T')[0],
-      doctorLicense: settings?.licenseNumber || 'NY-MED-849201',
     });
 
-    await newPrescription.save();
-
-    const formatted = {
-      ...newPrescription.toObject(),
-      id: newPrescription.prescriptionId,
-      dateIssued: newPrescription.prescriptionDate,
-      treatmentNotes: newPrescription.treatmentPlan,
-    };
+    await auditFromSession(auth.session, {
+      action: 'CREATE',
+      module: 'PRESCRIPTIONS',
+      resourceType: 'PRESCRIPTION',
+      resourceId: created.prescriptionId,
+      patientRef: patient.patientId,
+      description: `Issued prescription ${created.prescriptionId} for ${patient.fullName}`,
+    });
 
     return NextResponse.json({
       success: true,
-      data: formatted,
-      message: `Prescription ${newPrescription.prescriptionId} issued for ${patient.fullName}`,
+      data: formatPrescription(created),
+      message: `Prescription ${created.prescriptionId} issued for ${patient.fullName}`,
     });
   } catch (error: any) {
     console.error('Error issuing prescription:', error);
-    return NextResponse.json(
-      { success: false, error: 'Failed to issue prescription.' },
-      { status: 500 }
-    );
+    const { statusCode, message } = normalizeDatabaseError(error, 'Failed to issue prescription.');
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

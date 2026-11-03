@@ -43,3 +43,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local audit / debug scratch output (never committed)
+/scratch/
+/scratch2_*.txt

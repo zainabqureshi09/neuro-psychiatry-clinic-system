@@ -1,16 +1,22 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
+﻿import { NextResponse } from 'next/server';
 import { PatientSchema } from '@/lib/validators';
 import { authorizeUser } from '@/lib/permissions';
-import { listPatients, createPatient } from '@/lib/db/repositories/patientRepository';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import {
+  listPatients,
+  createPatient,
+  findPatientConflict,
+} from '@/lib/db/repositories/patientRepository';
+import { auditFromSession } from '@/lib/audit';
 
 // GET /api/patients - Search & list paginated patients
 export async function GET(req: Request) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
-    await dbConnect();
+    await ensureDatabaseReady();
     const { searchParams } = new URL(req.url);
     const query = searchParams.get('q') || searchParams.get('search') || '';
     const gender = searchParams.get('gender') || 'All';
@@ -38,20 +44,21 @@ export async function GET(req: Request) {
     });
   } catch (error: any) {
     console.error('Error fetching patients:', error);
-    return NextResponse.json(
-      { success: false, error: 'Database error fetching patient records.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Database error fetching patient records.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
 // POST /api/patients - Register new patient
 export async function POST(req: Request) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
     const validation = PatientSchema.safeParse(body);
@@ -63,7 +70,29 @@ export async function POST(req: Request) {
     }
 
     const patientData = validation.data;
-    const newPatient = await createPatient(patientData, auth.user?.userId || 'SYSTEM');
+
+    // Duplicate chart guard (phone / CNIC) - mirrors the Express controller
+    const conflict = await findPatientConflict(patientData.phone, (patientData as any).cnic);
+    if (conflict) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'A patient chart with this phone number or CNIC already exists.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const newPatient = await createPatient(patientData, auth.session?.userId || 'SYSTEM');
+
+    await auditFromSession(auth.session, {
+      action: 'CREATE',
+      module: 'PATIENTS',
+      resourceType: 'PATIENT',
+      resourceId: newPatient.patientId,
+      patientRef: newPatient.patientId,
+      description: `Registered new patient ${newPatient.fullName} (${newPatient.patientId})`,
+    });
 
     return NextResponse.json({
       success: true,
@@ -72,10 +101,10 @@ export async function POST(req: Request) {
     });
   } catch (error: any) {
     console.error('Error creating patient:', error);
-    return NextResponse.json(
-      { success: false, error: 'Failed to create patient record in database.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to create patient record in database.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
-

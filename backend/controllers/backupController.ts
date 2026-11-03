@@ -1,33 +1,16 @@
 import { Request, Response, NextFunction } from 'express';
-import User from '../../models/User';
-import Patient from '../../models/Patient';
-import ClinicalRecord from '../../models/ClinicalRecord';
-import Consultation from '../../models/Consultation';
-import Prescription from '../../models/Prescription';
-import Appointment from '../../models/Appointment';
-import TherapySession from '../../models/TherapySession';
-import FeeCategory from '../../models/FeeCategory';
-import Payment from '../../models/Payment';
-import AuditLog from '../../models/AuditLog';
-import BackupLog from '../../models/BackupLog';
-import ClinicSettings from '../../models/ClinicSettings';
 import { recordAuditEvent } from '../utils/auditLogger';
-
-/**
- * Helper to generate sequential Backup ID (BKP-XXXX format)
- */
-const generateBackupId = async (): Promise<string> => {
-  const count = await BackupLog.countDocuments();
-  let candidateNum = 101 + count;
-  let candidateId = `BKP-${candidateNum}`;
-
-  while (await BackupLog.exists({ backupId: candidateId })) {
-    candidateNum++;
-    candidateId = `BKP-${candidateNum}`;
-  }
-
-  return candidateId;
-};
+import { listUsers } from '../../lib/db/repositories/userRepository';
+import { listPatients } from '../../lib/db/repositories/patientRepository';
+import { listClinicalRecords } from '../../lib/db/repositories/clinicalRecordRepository';
+import { listConsultations } from '../../lib/db/repositories/consultationRepository';
+import { listPrescriptions } from '../../lib/db/repositories/prescriptionRepository';
+import { listAppointments } from '../../lib/db/repositories/appointmentRepository';
+import { listTherapySessions } from '../../lib/db/repositories/therapyRepository';
+import { getFeeCategories, getPayments } from '../../lib/db/repositories/billingRepository';
+import { listAuditLogs } from '../../lib/db/repositories/auditRepository';
+import { listBackupLogs, recordBackupLog } from '../../lib/db/repositories/backupRepository';
+import { getClinicSettings } from '../../lib/db/repositories/settingsRepository';
 
 /**
  * GET /api/backup/export
@@ -40,7 +23,7 @@ export const exportClinicData = async (req: Request, res: Response, next: NextFu
 
     const [
       usersRaw,
-      patients,
+      patientResult,
       clinicalRecords,
       consultations,
       prescriptions,
@@ -48,21 +31,26 @@ export const exportClinicData = async (req: Request, res: Response, next: NextFu
       therapySessions,
       feeCategories,
       payments,
-      auditLogs,
+      auditResult,
       settings,
     ] = await Promise.all([
-      User.find().select('-passwordHash -__v'),
-      Patient.find().select('-__v'),
-      ClinicalRecord.find().select('-__v'),
-      Consultation.find().select('-__v'),
-      Prescription.find().select('-__v'),
-      Appointment.find().select('-__v'),
-      TherapySession.find().select('-__v'),
-      FeeCategory.find().select('-__v'),
-      Payment.find().select('-__v'),
-      AuditLog.find().select('-__v').sort({ createdAt: -1 }).limit(1000),
-      ClinicSettings.findOne().select('-__v'),
+      listUsers(),
+      listPatients({ includeInactive: true, page: 1, limit: 100000 }),
+      listClinicalRecords(),
+      listConsultations(),
+      listPrescriptions(),
+      listAppointments(),
+      listTherapySessions(),
+      getFeeCategories(),
+      getPayments(),
+      listAuditLogs({ page: 1, limit: 200 }),
+      getClinicSettings(),
     ]);
+
+    const patients = patientResult.data;
+    // Never export credential material.
+    const users = usersRaw.map(({ passwordHash, ...safe }) => safe);
+    const auditLogs = auditResult.data;
 
     const dateStr = new Date().toISOString().split('T')[0];
     const exportMetadata = {
@@ -73,7 +61,7 @@ export const exportClinicData = async (req: Request, res: Response, next: NextFu
       exportedByUserId: adminUser?.userId || 'USR-ADMIN',
       clinic: settings || { clinicName: 'Neuro Psychiatry Clinic' },
       recordCounts: {
-        users: usersRaw.length,
+        users: users.length,
         patients: patients.length,
         clinicalRecords: clinicalRecords.length,
         consultations: consultations.length,
@@ -88,7 +76,7 @@ export const exportClinicData = async (req: Request, res: Response, next: NextFu
 
     const exportPayload = {
       metadata: exportMetadata,
-      users: usersRaw,
+      users,
       patients,
       clinicalRecords,
       consultations,
@@ -126,9 +114,9 @@ export const exportClinicData = async (req: Request, res: Response, next: NextFu
  * GET /api/backup
  * Retrieve history list of backup snapshot archives.
  */
-export const getBackupLogs = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+export const getBackupLogs = async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const logs = await BackupLog.find().sort({ createdAt: -1 });
+    const logs = await listBackupLogs(200);
 
     res.status(200).json({
       success: true,
@@ -149,28 +137,25 @@ export const createBackup = async (req: Request, res: Response, next: NextFuncti
     const adminUser = req.user;
     const backupType = req.body?.type || 'Full System';
 
-    const backupId = await generateBackupId();
     const dateStr = new Date().toISOString().split('T')[0].replace(/-/g, '');
     const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
     const fileName = `clinic-backup-${dateStr}-${backupType.toLowerCase().replace(/\s+/g, '')}.json`;
 
-    // Estimate file size based on document counts
-    const patientCount = await Patient.countDocuments();
-    const consultCount = await Consultation.countDocuments();
-    const estimatedSizeMB = (0.5 + (patientCount * 0.05) + (consultCount * 0.02)).toFixed(1);
-    const fileSize = `${estimatedSizeMB} MB`;
+    // Estimate file size based on record counts
+    const [patientResult, consultations] = await Promise.all([
+      listPatients({ includeInactive: true, page: 1, limit: 100000 }),
+      listConsultations(),
+    ]);
+    const estimatedSizeMB = (0.5 + patientResult.total * 0.05 + consultations.length * 0.02).toFixed(1);
 
-    const newBackup = new BackupLog({
-      backupId,
+    const newBackup = await recordBackupLog({
       timestamp,
       fileName,
-      fileSize,
+      fileSize: `${estimatedSizeMB} MB`,
       type: backupType,
       status: 'Completed',
       createdByName: adminUser?.name || 'Administrator',
     });
-
-    await newBackup.save();
 
     // Log server-side audit event for backup creation
     await recordAuditEvent({
@@ -179,8 +164,8 @@ export const createBackup = async (req: Request, res: Response, next: NextFuncti
       userRole: adminUser?.role || 'ADMIN',
       action: 'BACKUP',
       module: 'BACKUP',
-      resourceId: backupId,
-      description: `Created local ${backupType} database backup snapshot archive (${fileName}, ${fileSize})`,
+      resourceId: newBackup.backupId,
+      description: `Created local ${backupType} database backup snapshot archive (${fileName}, ${newBackup.fileSize})`,
     });
 
     res.status(201).json({
@@ -192,3 +177,4 @@ export const createBackup = async (req: Request, res: Response, next: NextFuncti
     next(error);
   }
 };
+

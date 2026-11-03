@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import User from '@/models/User';
 import { getSession } from '@/lib/auth';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import { findUserById } from '@/lib/db/repositories/userRepository';
 
 export async function GET() {
   try {
@@ -13,12 +14,19 @@ export async function GET() {
       );
     }
 
-    await dbConnect();
-    const user = await User.findOne({ userId: session.userId });
+    await ensureDatabaseReady();
+    const user = await findUserById(session.userId);
     if (!user) {
       return NextResponse.json(
         { success: false, error: 'User record not found' },
         { status: 404 }
+      );
+    }
+
+    if (!user.isActive) {
+      return NextResponse.json(
+        { success: false, error: 'User account is deactivated. Contact practice admin.' },
+        { status: 403 }
       );
     }
 
@@ -40,9 +48,11 @@ export async function GET() {
       data: userResponse,
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to retrieve current user session' },
-      { status: 500 }
+    console.error('Error loading current user:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to retrieve current user session'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

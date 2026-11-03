@@ -140,6 +140,57 @@ Follow this 17-step checklist before making the application publicly accessible:
 
 ---
 
+## 7.1 PostgreSQL Data Layer (Phase Three)
+
+The application now runs on a repository-based data layer with two interchangeable
+providers. All database access is server-side only; no secret key is ever exposed
+to the browser bundle.
+
+### Provider selection
+
+| Provider | When it is used | Reads / writes | Transactions |
+| --- | --- | --- | --- |
+| `postgres` | `SUPABASE_URL` + `SUPABASE_SECRET_KEY` are configured | Supabase JS client (PostgREST) | `pg` Pool via `DATABASE_URL` (optional) |
+| `mongodb` | Supabase is not configured, or `DB_PROVIDER=mongodb` | preserved Mongoose implementation | MongoDB |
+
+`DATABASE_URL` on its own never selects the PostgreSQL stack: standard operations
+require the Supabase client, and the pool is only used for atomic multi-entity
+writes.
+
+### Architecture
+
+- `lib/db/config.ts` – provider resolution, credential masking, DNS pre-flight checks.
+- `lib/db/supabase.ts` – memoized server-side Supabase client (`service role`/secret key).
+- `lib/db/postgres.ts` – `pg` connection pool, `withTransaction()` (BEGIN/COMMIT/ROLLBACK), health probe.
+- `lib/db/repositories/*` – one repository per entity; each supports Supabase → MongoDB fallback.
+- `lib/db/repositories/consultationCascade.ts` – consultation + prescription + follow-up + chart timestamps in one transaction.
+- `lib/db/errors.ts` – typed errors and safe HTTP mapping (503 / 409 / 400 / 500).
+- `lib/audit.ts` – non-blocking audit logging shared by all Next.js route handlers.
+- `ensureDatabaseReady()` – replaces `dbConnect()` in routes so PostgreSQL mode never opens MongoDB.
+
+### Safety rules enforced in code
+
+- Unresolvable Supabase hosts are rejected before any connection attempt (`isSupabaseReachable`).
+- `receipt_number` is immutable in the application layer and enforced again by the
+  `trg_payments_immutable_receipt` trigger in `supabase/migrations`.
+- Patients use **soft deletion** (`is_active = false`, `status = 'Discharged'`); clinical
+  records, prescriptions, appointments, payments, follow-ups and audit logs are preserved.
+- Credentials are masked in logs; password hashes never leave the server.
+
+### Validation
+
+```bash
+npm run test:postgres   # offline suite: repositories, transactions, auth, RBAC, errors
+npx tsc --noEmit        # type check
+npm run lint            # ESLint
+npm run build           # production build
+```
+
+`npm run test:postgres` uses an in-memory Supabase double and a fake `pg` pool, so it
+runs without any live project credentials.
+
+---
+
 ## 8. Demo vs. Production Data Disclaimer
 - **Demo Seed Script (`scripts/seed.ts`)**: Designed exclusively for local development and client demonstration. Automatically blocked from executing in production mode (`NODE_ENV=production`) unless `--force-production-seed` is explicitly supplied.
 - **Production Seeding**: In production mode, the backend boots up cleanly without demo records and automatically seeds a single initial administrator account if `INITIAL_ADMIN_EMAIL` and `INITIAL_ADMIN_PASSWORD` are configured.

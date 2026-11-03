@@ -1,48 +1,19 @@
 import { Request, Response, NextFunction } from 'express';
-import ClinicSettings, { IClinicSettings } from '../../models/ClinicSettings';
 import { recordAuditEvent } from '../utils/auditLogger';
-
-/**
- * Get or initialize default clinic settings document
- */
-const getOrCreateSettings = async (): Promise<IClinicSettings> => {
-  let settings = await ClinicSettings.findOne();
-  if (!settings) {
-    settings = new ClinicSettings({
-      clinicName: 'Neuro Psychiatry Clinic',
-      department: 'Psychiatry',
-      doctorDesignation: 'HOD & Consultant Psychiatrist',
-      education: 'MBBS, MCPS, FCPS, CHPE',
-      practiceName: 'Neuro Psychiatry Clinic',
-      tagline: 'Psychiatry Department • HOD & Consultant Psychiatrist',
-      doctorName: 'DR SHAHAB MUHAMMAD',
-      licenseNumber: 'NY-MED-849201',
-      phone: '+1 (555) 800-VANCE',
-      email: 'appointments@vancepsychiatry.com',
-      address: '680 Fifth Avenue, Suite 1800, New York, NY 10019',
-      workingDays: ['Monday', 'Wednesday', 'Friday'],
-      clinicStartTime: '18:00',
-      clinicEndTime: '20:00',
-      appointmentDuration: 45,
-      breakStartTime: '',
-      breakEndTime: '',
-      notifyEmail: true,
-      notifySMS: true,
-      autoRemind24h: true,
-    });
-    await settings.save();
-  }
-  return settings;
-};
+import {
+  getClinicSettings,
+  updateClinicSettings,
+  ClinicSettingsRecord,
+} from '../../lib/db/repositories/settingsRepository';
 
 /**
  * GET /api/settings
  * Retrieve clinic profile & operating configuration.
  * Accessible to all authenticated staff members.
  */
-export const getSettings = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+export const getSettings = async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const settings = await getOrCreateSettings();
+    const settings = await getClinicSettings();
 
     res.status(200).json({
       success: true,
@@ -59,7 +30,6 @@ export const getSettings = async (req: Request, res: Response, next: NextFunctio
  */
 export const updateSettings = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const settings = await getOrCreateSettings();
     const adminUser = req.user;
 
     const {
@@ -90,34 +60,40 @@ export const updateSettings = async (req: Request, res: Response, next: NextFunc
       autoRemind24h,
     } = req.body;
 
-    if (clinicName !== undefined) settings.clinicName = clinicName.trim();
-    if (department !== undefined) settings.department = department.trim();
-    if (doctorDesignation !== undefined) settings.doctorDesignation = doctorDesignation.trim();
-    if (education !== undefined) settings.education = education.trim();
-    if (practiceName !== undefined) settings.practiceName = practiceName.trim();
-    if (tagline !== undefined) settings.tagline = tagline.trim();
-    if (doctorName !== undefined) settings.doctorName = doctorName.trim();
-    if (licenseNumber !== undefined) settings.licenseNumber = licenseNumber.trim();
-    if (phone !== undefined) settings.phone = phone.trim();
-    if (email !== undefined) settings.email = email.trim();
-    if (address !== undefined) settings.address = address.trim();
-    if (workingDays !== undefined && Array.isArray(workingDays)) settings.workingDays = workingDays;
+    const updates: Partial<ClinicSettingsRecord> = {};
 
-    if (clinicStartTime || clinicStart) settings.clinicStartTime = (clinicStartTime || clinicStart).trim();
-    if (clinicEndTime || clinicEnd) settings.clinicEndTime = (clinicEndTime || clinicEnd).trim();
+    if (clinicName !== undefined) updates.clinicName = String(clinicName).trim();
+    if (department !== undefined) updates.department = String(department).trim();
+    if (doctorDesignation !== undefined) updates.doctorDesignation = String(doctorDesignation).trim();
+    if (education !== undefined) updates.education = String(education).trim();
+    if (practiceName !== undefined) updates.practiceName = String(practiceName).trim();
+    if (tagline !== undefined) updates.tagline = String(tagline).trim();
+    if (doctorName !== undefined) updates.doctorName = String(doctorName).trim();
+    if (licenseNumber !== undefined) updates.licenseNumber = String(licenseNumber).trim();
+    if (phone !== undefined) updates.phone = String(phone).trim();
+    if (email !== undefined) updates.email = String(email).trim();
+    if (address !== undefined) updates.address = String(address).trim();
+    if (workingDays !== undefined && Array.isArray(workingDays)) updates.workingDays = workingDays;
+
+    if (clinicStartTime || clinicStart) updates.clinicStartTime = String(clinicStartTime || clinicStart).trim();
+    if (clinicEndTime || clinicEnd) updates.clinicEndTime = String(clinicEndTime || clinicEnd).trim();
 
     if (appointmentDuration !== undefined || slotDurationMinutes !== undefined) {
-      settings.appointmentDuration = Number(appointmentDuration ?? slotDurationMinutes);
+      updates.appointmentDuration = Number(appointmentDuration ?? slotDurationMinutes);
     }
 
-    if (breakStartTime !== undefined || breakStart !== undefined) settings.breakStartTime = (breakStartTime ?? breakStart ?? '').trim();
-    if (breakEndTime !== undefined || breakEnd !== undefined) settings.breakEndTime = (breakEndTime ?? breakEnd ?? '').trim();
+    if (breakStartTime !== undefined || breakStart !== undefined) {
+      updates.breakStartTime = String(breakStartTime ?? breakStart ?? '').trim();
+    }
+    if (breakEndTime !== undefined || breakEnd !== undefined) {
+      updates.breakEndTime = String(breakEndTime ?? breakEnd ?? '').trim();
+    }
 
-    if (notifyEmail !== undefined) settings.notifyEmail = Boolean(notifyEmail);
-    if (notifySMS !== undefined) settings.notifySMS = Boolean(notifySMS);
-    if (autoRemind24h !== undefined) settings.autoRemind24h = Boolean(autoRemind24h);
+    if (notifyEmail !== undefined) updates.notifyEmail = Boolean(notifyEmail);
+    if (notifySMS !== undefined) updates.notifySms = Boolean(notifySMS);
+    if (autoRemind24h !== undefined) updates.autoRemind24h = Boolean(autoRemind24h);
 
-    await settings.save();
+    const settings = await updateClinicSettings(updates);
 
     // Log server-side audit event for settings update
     await recordAuditEvent({

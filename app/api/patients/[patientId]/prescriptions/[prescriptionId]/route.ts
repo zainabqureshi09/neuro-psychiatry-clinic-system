@@ -1,19 +1,34 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import Prescription from '@/models/Prescription';
-import Patient from '@/models/Patient';
+﻿import { NextResponse } from 'next/server';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import {
+  getPrescriptionById,
+  updatePrescription,
+} from '@/lib/db/repositories/prescriptionRepository';
+import { getPatientById } from '@/lib/db/repositories/patientRepository';
+import { auditFromSession } from '@/lib/audit';
+
+const RESTRICTED = '[Restricted: Clinical Note Access Limited for Reception]';
 
 function sanitizeForReception(rx: any) {
   return {
     ...rx,
-    treatmentNotes: '[Restricted: Clinical Note Access Limited for Reception]',
-    treatmentPlan: '[Restricted: Clinical Note Access Limited for Reception]',
-    instructions: '[Restricted: Clinical Note Access Limited for Reception]',
+    treatmentNotes: RESTRICTED,
+    treatmentPlan: RESTRICTED,
+    instructions: RESTRICTED,
     medications: rx.medications?.map((m: any) => ({
       ...m,
       instructions: '[Restricted for Reception]',
     })),
+  };
+}
+
+function formatPrescription(rx: any) {
+  return {
+    ...rx,
+    id: rx.prescriptionId,
+    dateIssued: rx.prescriptionDate || rx.dateIssued,
   };
 }
 
@@ -23,16 +38,13 @@ export async function GET(
   { params }: { params: Promise<{ patientId: string; prescriptionId: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'RECEPTION', 'ADMIN', 'THERAPIST']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'RECEPTION', 'ADMIN', 'THERAPIST'], req);
     if (!auth.authorized) return auth.response!;
 
     const { patientId, prescriptionId } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
 
-    const isValidPatientObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId }, { _id: isValidPatientObjectId ? patientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       return NextResponse.json(
@@ -41,36 +53,29 @@ export async function GET(
       );
     }
 
-    const isValidRxObjectId = /^[0-9a-fA-F]{24}$/.test(prescriptionId);
-    const rx = await Prescription.findOne({
-      $or: [{ prescriptionId }, { _id: isValidRxObjectId ? prescriptionId : null }],
-      patientId: patient.patientId,
-    }).lean();
+    const rx = await getPrescriptionById(prescriptionId);
 
-    if (!rx) {
+    if (!rx || rx.patientId !== patient.patientId) {
       return NextResponse.json(
         { success: false, error: `Prescription record not found for ID: ${prescriptionId}` },
         { status: 404 }
       );
     }
 
+    const formatted = formatPrescription(rx);
     const isReception = auth.session?.role === 'RECEPTION' || auth.session?.role === 'RECEPTIONIST';
-    const formatted = {
-      ...rx,
-      id: rx.prescriptionId,
-      dateIssued: rx.prescriptionDate || rx.dateIssued,
-    };
-    const data = isReception ? sanitizeForReception(formatted) : formatted;
 
     return NextResponse.json({
       success: true,
-      data,
+      data: isReception ? sanitizeForReception(formatted) : formatted,
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to fetch prescription details.' },
-      { status: 500 }
+    console.error('Error fetching prescription:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to fetch prescription details.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
@@ -80,17 +85,14 @@ export async function PUT(
   { params }: { params: Promise<{ patientId: string; prescriptionId: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { patientId, prescriptionId } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
-    const isValidPatientObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId }, { _id: isValidPatientObjectId ? patientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       return NextResponse.json(
@@ -99,11 +101,22 @@ export async function PUT(
       );
     }
 
-    const isValidRxObjectId = /^[0-9a-fA-F]{24}$/.test(prescriptionId);
-    const rx = await Prescription.findOne({
-      $or: [{ prescriptionId }, { _id: isValidRxObjectId ? prescriptionId : null }],
-      patientId: patient.patientId,
-    });
+    const existing = await getPrescriptionById(prescriptionId);
+
+    if (!existing || existing.patientId !== patient.patientId) {
+      return NextResponse.json(
+        { success: false, error: `Prescription record not found for ID: ${prescriptionId}` },
+        { status: 404 }
+      );
+    }
+
+    // Identifiers are immutable.
+    delete body.id;
+    delete body._id;
+    delete body.prescriptionId;
+    delete body.patientId;
+
+    const rx = await updatePrescription(existing.prescriptionId, body);
 
     if (!rx) {
       return NextResponse.json(
@@ -112,22 +125,26 @@ export async function PUT(
       );
     }
 
-    Object.assign(rx, body);
-    await rx.save();
+    await auditFromSession(auth.session, {
+      action: 'UPDATE',
+      module: 'PRESCRIPTIONS',
+      resourceType: 'PRESCRIPTION',
+      resourceId: rx.prescriptionId,
+      patientRef: patient.patientId,
+      description: `Updated prescription ${rx.prescriptionId} for ${patient.fullName}`,
+    });
 
     return NextResponse.json({
       success: true,
-      data: {
-        ...rx.toObject(),
-        id: rx.prescriptionId,
-        dateIssued: rx.prescriptionDate || rx.dateIssued,
-      },
+      data: formatPrescription(rx),
       message: 'Prescription record updated successfully.',
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to update prescription record.' },
-      { status: 500 }
+    console.error('Error updating prescription:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to update prescription record.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

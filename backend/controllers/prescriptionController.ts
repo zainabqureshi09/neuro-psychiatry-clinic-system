@@ -1,41 +1,35 @@
 import { Request, Response, NextFunction } from "express";
-import Prescription, { IPrescription } from "../../models/Prescription";
-import Patient from "../../models/Patient";
-import ClinicSettings from "../../models/ClinicSettings";
 import { recordAuditEvent } from "../utils/auditLogger";
-
-/**
- * Helper to generate sequential Prescription ID (RX-XXXX)
- */
-const generatePrescriptionId = async (): Promise<string> => {
-  const count = await Prescription.countDocuments();
-  let candidateNum = 901 + count;
-  let candidateId = `RX-${candidateNum}`;
-
-  while (await Prescription.exists({ prescriptionId: candidateId })) {
-    candidateNum++;
-    candidateId = `RX-${candidateNum}`;
-  }
-
-  return candidateId;
-};
+import {
+  listPrescriptions,
+  getPrescriptionById as getPrescriptionRecord,
+  createPrescription as createPrescriptionRecord,
+  updatePrescription as updatePrescriptionRecord,
+} from "../../lib/db/repositories/prescriptionRepository";
+import { getPatientById } from "../../lib/db/repositories/patientRepository";
+import { getClinicSettings } from "../../lib/db/repositories/settingsRepository";
 
 /**
  * Helper to sanitize clinical prescription details for RECEPTION role
  */
 const sanitizeForReception = (rx: any) => {
-  const obj = typeof rx.toObject === "function" ? rx.toObject() : { ...rx };
   return {
-    ...obj,
+    ...rx,
     treatmentNotes: "[Restricted: Clinical Note Access Limited for Reception]",
     treatmentPlan: "[Restricted: Clinical Note Access Limited for Reception]",
     instructions: "[Restricted: Clinical Note Access Limited for Reception]",
-    medications: obj.medications?.map((m: any) => ({
+    medications: rx.medications?.map((m: any) => ({
       ...m,
       instructions: "[Restricted for Reception]",
     })),
   };
 };
+
+const formatPrescription = (rx: any) => ({
+  ...rx,
+  id: rx.prescriptionId,
+  dateIssued: rx.prescriptionDate || rx.dateIssued,
+});
 
 /**
  * GET /api/patients/:patientId/prescriptions (and GET /api/prescriptions)
@@ -49,14 +43,11 @@ export const getPatientPrescriptions = async (
   try {
     const rawPatientId = req.params.patientId || (req.query.patientId as string);
     const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : (rawPatientId as string);
-    const filter: Record<string, any> = {};
+
+    let effectivePatientId: string | undefined;
 
     if (patientId) {
-      const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-      const patient = await Patient.findOne({
-        $or: [{ patientId }, { _id: isValidObjectId ? patientId : null }],
-      });
-
+      const patient = await getPatientById(patientId);
       if (!patient) {
         res.status(404).json({
           success: false,
@@ -64,19 +55,16 @@ export const getPatientPrescriptions = async (
         });
         return;
       }
-      filter.patientId = patient.patientId;
+      effectivePatientId = patient.patientId;
     }
 
-    const prescriptions = await Prescription.find(filter).sort({ prescriptionDate: -1, createdAt: -1 });
+    const prescriptions = await listPrescriptions({ patientId: effectivePatientId });
 
     const isReception = req.user?.role === "RECEPTION" || req.user?.role === "RECEPTIONIST";
-    const data = isReception
-      ? prescriptions.map(r => sanitizeForReception(r))
-      : prescriptions.map(r => ({
-          ...r.toObject(),
-          id: r.prescriptionId,
-          dateIssued: r.prescriptionDate || r.dateIssued,
-        }));
+    const data = prescriptions.map((r) => {
+      const item = formatPrescription(r);
+      return isReception ? sanitizeForReception(item) : item;
+    });
 
     res.status(200).json({
       success: true,
@@ -100,11 +88,8 @@ export const getPrescriptionById = async (
   try {
     const rawParam = req.params.prescriptionId || req.params.id;
     const prescriptionId = Array.isArray(rawParam) ? rawParam[0] : (rawParam as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(prescriptionId);
 
-    const rx = await Prescription.findOne({
-      $or: [{ prescriptionId }, { _id: isValidObjectId ? prescriptionId : null }],
-    });
+    const rx = await getPrescriptionRecord(prescriptionId);
 
     if (!rx) {
       res.status(404).json({
@@ -114,38 +99,35 @@ export const getPrescriptionById = async (
       return;
     }
 
-    if (req.params.patientId && rx.patientId !== req.params.patientId) {
-      const patient = await Patient.findOne({ patientId: req.params.patientId });
-      if (!patient || rx.patientId !== patient.patientId) {
+    const rawPatientId = req.params.patientId;
+    const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : rawPatientId;
+    if (patientId && rx.patientId !== patientId) {
+      const patient = await getPatientById(patientId);
+      if (!patient || patient.patientId !== rx.patientId) {
         res.status(404).json({
           success: false,
-          error: `Prescription ${prescriptionId} does not belong to patient ${req.params.patientId}`,
+          error: `Prescription record not found for ID: ${prescriptionId}`,
         });
         return;
       }
     }
 
     const isReception = req.user?.role === "RECEPTION" || req.user?.role === "RECEPTIONIST";
-    const data = isReception
-      ? sanitizeForReception(rx)
-      : {
-          ...rx.toObject(),
-          id: rx.prescriptionId,
-          dateIssued: rx.prescriptionDate || rx.dateIssued,
-        };
+    const formatted = formatPrescription(rx);
 
     res.status(200).json({
       success: true,
-      data,
+      data: isReception ? sanitizeForReception(formatted) : formatted,
     });
   } catch (error) {
     next(error);
   }
 };
 
+
 /**
  * POST /api/patients/:patientId/prescriptions (and POST /api/prescriptions)
- * Create a new digital prescription (DOCTOR & ADMIN only)
+ * Issue a new prescription for a patient.
  */
 export const createPrescription = async (
   req: Request,
@@ -153,45 +135,27 @@ export const createPrescription = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    if (req.user?.role === "RECEPTION" || req.user?.role === "RECEPTIONIST") {
-      res.status(403).json({
-        success: false,
-        error: "Access denied. Reception staff are not authorized to create digital prescriptions.",
-      });
-      return;
-    }
+    const rawPatientId = req.params.patientId || req.body.patientId;
+    const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : (rawPatientId as string);
 
-    const targetPatientId = req.params.patientId || req.body.patientId;
-    if (!targetPatientId) {
-      res.status(400).json({
-        success: false,
-        error: "Patient ID reference is required to issue a prescription.",
-      });
-      return;
-    }
-
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetPatientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId: targetPatientId }, { _id: isValidObjectId ? targetPatientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       res.status(404).json({
         success: false,
-        error: `Patient record not found for ID: ${targetPatientId}`,
+        error: `Patient record not found for ID: ${patientId}`,
       });
       return;
     }
 
-    const settings = await ClinicSettings.findOne();
-    const prescriptionId = await generatePrescriptionId();
-    const doctorId = req.user?.userId || req.user?._id?.toString() || req.body.doctorId || "USR-001";
+    const settings = await getClinicSettings();
+    const doctorId = req.user?.userId || req.body.doctorId || "USR-001";
     const doctorName = req.user?.name || req.body.doctorName || "DR SHAHAB MUHAMMAD";
-    const doctorLicense = req.body.doctorLicense || settings?.licenseNumber || "NY-MED-849201";
-    const prescriptionDate = req.body.prescriptionDate || req.body.dateIssued || new Date().toISOString().split("T")[0];
+    const prescriptionDate =
+      req.body.prescriptionDate || req.body.dateIssued || new Date().toISOString().split("T")[0];
 
-    const newPrescription = new Prescription({
-      prescriptionId,
+    const newPrescription = await createPrescriptionRecord({
+      prescriptionId: req.body.prescriptionId,
       patientId: patient.patientId,
       patientName: patient.fullName,
       patientAge: patient.age,
@@ -200,43 +164,33 @@ export const createPrescription = async (
       doctorName,
       clinicianId: doctorId,
       clinicianName: doctorName,
-      doctorLicense,
+      doctorLicense: req.body.doctorLicense || settings.licenseNumber || "NY-MED-849201",
       prescriptionDate,
       dateIssued: prescriptionDate,
-      consultationId: req.body.consultationId || "",
       diagnosis: req.body.diagnosis,
-      medications: req.body.medications,
-      treatmentPlan: req.body.treatmentNotes || req.body.treatmentPlan || "",
+      medications: req.body.medications || [],
+      treatmentPlan: req.body.treatmentPlan || req.body.treatmentNotes || "",
       treatmentNotes: req.body.treatmentNotes || req.body.treatmentPlan || "",
-      instructions: req.body.instructions || "",
+      instructions: req.body.instructions,
+      notes: req.body.notes,
       status: req.body.status || "Active",
     });
 
-    await newPrescription.save();
-
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: "CREATE",
-        module: "PRESCRIPTION",
-        resourceId: prescriptionId,
-        patientRef: patient.patientId,
-        description: `Issued digital prescription ${prescriptionId} for ${patient.fullName}`,
-      });
-    }
-
-    const formattedData = {
-      ...newPrescription.toObject(),
-      id: newPrescription.prescriptionId,
-      dateIssued: newPrescription.prescriptionDate,
-    };
+    await recordAuditEvent({
+      userId: doctorId,
+      userName: doctorName,
+      userRole: req.user?.role,
+      action: "CREATE",
+      module: "PRESCRIPTION",
+      resourceId: newPrescription.prescriptionId,
+      patientRef: patient.patientId,
+      description: `Issued digital prescription ${newPrescription.prescriptionId} for ${patient.fullName}`,
+    });
 
     res.status(201).json({
       success: true,
-      message: `Prescription ${prescriptionId} issued successfully for patient ${patient.fullName}`,
-      data: formattedData,
+      message: `Prescription ${newPrescription.prescriptionId} issued successfully for ${patient.fullName}.`,
+      data: formatPrescription(newPrescription),
     });
   } catch (error) {
     next(error);
@@ -245,7 +199,7 @@ export const createPrescription = async (
 
 /**
  * PUT /api/patients/:patientId/prescriptions/:prescriptionId (and PUT /api/prescriptions/:id)
- * Update an existing prescription (DOCTOR & ADMIN only)
+ * Update an existing prescription record (identifiers are immutable).
  */
 export const updatePrescription = async (
   req: Request,
@@ -253,23 +207,12 @@ export const updatePrescription = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    if (req.user?.role === "RECEPTION" || req.user?.role === "RECEPTIONIST") {
-      res.status(403).json({
-        success: false,
-        error: "Access denied. Reception staff are not authorized to update digital prescriptions.",
-      });
-      return;
-    }
-
     const rawParam = req.params.prescriptionId || req.params.id;
     const prescriptionId = Array.isArray(rawParam) ? rawParam[0] : (rawParam as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(prescriptionId);
 
-    const rx = await Prescription.findOne({
-      $or: [{ prescriptionId }, { _id: isValidObjectId ? prescriptionId : null }],
-    });
+    const existing = await getPrescriptionRecord(prescriptionId);
 
-    if (!rx) {
+    if (!existing) {
       res.status(404).json({
         success: false,
         error: `Prescription record not found for ID: ${prescriptionId}`,
@@ -288,24 +231,30 @@ export const updatePrescription = async (
       "dateIssued",
     ];
 
+    const updates: Record<string, any> = {};
     allowedUpdates.forEach((key) => {
       if (req.body[key] !== undefined) {
-        (rx as any)[key] = req.body[key];
+        updates[key] = req.body[key];
       }
     });
 
-    await rx.save();
+    const rx = (await updatePrescriptionRecord(existing.prescriptionId, updates)) || existing;
 
-    const formattedData = {
-      ...rx.toObject(),
-      id: rx.prescriptionId,
-      dateIssued: rx.prescriptionDate,
-    };
+    await recordAuditEvent({
+      userId: req.user?.userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "UPDATE",
+      module: "PRESCRIPTION",
+      resourceId: rx.prescriptionId,
+      patientRef: rx.patientId,
+      description: `Updated prescription ${rx.prescriptionId}`,
+    });
 
     res.status(200).json({
       success: true,
       message: `Prescription ${rx.prescriptionId} updated successfully.`,
-      data: formattedData,
+      data: formatPrescription(rx),
     });
   } catch (error) {
     next(error);
@@ -328,11 +277,8 @@ export const reusePrescription = async (req: Request, res: Response, next: NextF
 
     const rawId = req.params.prescriptionId || req.params.id;
     const id = Array.isArray(rawId) ? rawId[0] : (rawId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const originalRx = await Prescription.findOne({
-      $or: [{ prescriptionId: id }, { _id: isValidObjectId ? id : null }],
-    });
+    const originalRx = await getPrescriptionRecord(id);
 
     if (!originalRx) {
       res.status(404).json({
@@ -342,9 +288,7 @@ export const reusePrescription = async (req: Request, res: Response, next: NextF
       return;
     }
 
-    const newPrescriptionId = await generatePrescriptionId();
-    const newRx = new Prescription({
-      prescriptionId: newPrescriptionId,
+    const reissued = await createPrescriptionRecord({
       patientId: originalRx.patientId,
       patientName: originalRx.patientName,
       patientAge: originalRx.patientAge,
@@ -355,34 +299,27 @@ export const reusePrescription = async (req: Request, res: Response, next: NextF
       prescriptionDate: new Date().toISOString().split("T")[0],
       diagnosis: originalRx.diagnosis,
       medications: originalRx.medications,
-      notes: `Reissued from ${originalRx.prescriptionId}. ${originalRx.notes || ''}`.trim(),
+      treatmentPlan: originalRx.treatmentPlan,
+      notes: `Reissued from ${originalRx.prescriptionId}. ${originalRx.notes || ""}`.trim(),
       status: "Active",
       createdBy: req.user?.userId || req.user?.name || "DOCTOR",
     });
 
-    await newRx.save();
-
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: "CREATE",
-        module: "PRESCRIPTION",
-        resourceId: newPrescriptionId,
-        patientRef: originalRx.patientId,
-        description: `Reissued digital prescription ${newPrescriptionId} (from ${originalRx.prescriptionId}) for ${originalRx.patientName}`,
-      });
-    }
+    await recordAuditEvent({
+      userId: req.user?.userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "CREATE",
+      module: "PRESCRIPTION",
+      resourceId: reissued.prescriptionId,
+      patientRef: originalRx.patientId,
+      description: `Reissued digital prescription ${reissued.prescriptionId} (from ${originalRx.prescriptionId}) for ${originalRx.patientName}`,
+    });
 
     res.status(201).json({
       success: true,
-      message: `Prescription reissued successfully as ${newPrescriptionId}.`,
-      data: {
-        ...newRx.toObject(),
-        id: newRx.prescriptionId,
-        dateIssued: newRx.prescriptionDate,
-      },
+      message: `Prescription reissued successfully as ${reissued.prescriptionId}.`,
+      data: formatPrescription(reissued),
     });
   } catch (error) {
     next(error);

@@ -1,11 +1,18 @@
 import { Request, Response, NextFunction } from "express";
-import User, { IUser, UserRole } from "../../models/User";
 import { verifyToken, TokenPayload } from "../utils/authUtils";
+import { findUserById, UserRecord } from "../../lib/db/repositories/userRepository";
+import { UserRole, IUserPermissions } from "../../models/User";
+
+/**
+ * Authenticated staff principal attached to Express requests.
+ * The bcrypt hash is stripped before the object leaves the data layer.
+ */
+export type AuthenticatedUser = Omit<UserRecord, "passwordHash">;
 
 declare global {
   namespace Express {
     interface Request {
-      user?: IUser;
+      user?: AuthenticatedUser;
       tokenPayload?: TokenPayload;
     }
   }
@@ -39,7 +46,8 @@ const extractToken = (req: Request): string | null => {
 };
 
 /**
- * Authentication Middleware: Verifies JWT token and attaches user document to req.user
+ * Authentication Middleware: Verifies the custom JWT and attaches the staff
+ * account resolved through the repository layer (PostgreSQL or MongoDB).
  */
 export const authenticate = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
@@ -62,7 +70,7 @@ export const authenticate = async (req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    const user = await User.findById(payload.id);
+    const user = await findUserById(payload.userId || payload.id);
 
     if (!user) {
       res.status(401).json({
@@ -80,7 +88,8 @@ export const authenticate = async (req: Request, res: Response, next: NextFuncti
       return;
     }
 
-    req.user = user;
+    const { passwordHash, ...safeUser } = user;
+    req.user = safeUser;
     req.tokenPayload = payload;
     next();
   } catch (error) {
@@ -102,7 +111,7 @@ export const requireRole = (...allowedRoles: UserRole[]) => {
     }
 
     const userRole = req.user.role;
-    
+
     // Normalize RECEPTION / RECEPTIONIST equivalent roles
     const isAuthorized = allowedRoles.some((role) => {
       if (role === "RECEPTION" && userRole === "RECEPTIONIST") return true;
@@ -123,9 +132,9 @@ export const requireRole = (...allowedRoles: UserRole[]) => {
 };
 
 /**
- * Granular Permission Authorization Middleware: Checks if req.user has a specific permission flag enabled.
+ * Granular Permission Authorization Middleware: Checks a specific permission flag.
  */
-export const requirePermission = (permissionKey: keyof IUser['permissions']) => {
+export const requirePermission = (permissionKey: keyof IUserPermissions) => {
   return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {
       res.status(401).json({

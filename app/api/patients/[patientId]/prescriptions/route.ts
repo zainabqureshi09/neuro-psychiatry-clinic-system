@@ -1,21 +1,33 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import Prescription from '@/models/Prescription';
-import Patient from '@/models/Patient';
-import ClinicSettings from '@/models/ClinicSettings';
+﻿import { NextResponse } from 'next/server';
 import { PrescriptionSchema } from '@/lib/validators';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import { listPrescriptions, createPrescription } from '@/lib/db/repositories/prescriptionRepository';
+import { getPatientById } from '@/lib/db/repositories/patientRepository';
+import { getClinicSettings } from '@/lib/db/repositories/settingsRepository';
+import { auditFromSession } from '@/lib/audit';
+
+const RESTRICTED = '[Restricted: Clinical Note Access Limited for Reception]';
 
 function sanitizeForReception(rx: any) {
   return {
     ...rx,
-    treatmentNotes: '[Restricted: Clinical Note Access Limited for Reception]',
-    treatmentPlan: '[Restricted: Clinical Note Access Limited for Reception]',
-    instructions: '[Restricted: Clinical Note Access Limited for Reception]',
+    treatmentNotes: RESTRICTED,
+    treatmentPlan: RESTRICTED,
+    instructions: RESTRICTED,
     medications: rx.medications?.map((m: any) => ({
       ...m,
       instructions: '[Restricted for Reception]',
     })),
+  };
+}
+
+function formatPrescription(rx: any) {
+  return {
+    ...rx,
+    id: rx.prescriptionId,
+    dateIssued: rx.prescriptionDate || rx.dateIssued,
   };
 }
 
@@ -25,16 +37,13 @@ export async function GET(
   { params }: { params: Promise<{ patientId: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'RECEPTION', 'ADMIN', 'THERAPIST']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'RECEPTION', 'ADMIN', 'THERAPIST'], req);
     if (!auth.authorized) return auth.response!;
 
     const { patientId } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
 
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId }, { _id: isValidObjectId ? patientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       return NextResponse.json(
@@ -43,17 +52,11 @@ export async function GET(
       );
     }
 
-    const prescriptions = await Prescription.find({ patientId: patient.patientId })
-      .sort({ prescriptionDate: -1, createdAt: -1 })
-      .lean();
-
+    const prescriptions = await listPrescriptions({ patientId: patient.patientId });
     const isReception = auth.session?.role === 'RECEPTION' || auth.session?.role === 'RECEPTIONIST';
-    const formatted = prescriptions.map((r: any) => {
-      const item = {
-        ...r,
-        id: r.prescriptionId,
-        dateIssued: r.prescriptionDate || r.dateIssued,
-      };
+
+    const formatted = prescriptions.map((r) => {
+      const item = formatPrescription(r);
       return isReception ? sanitizeForReception(item) : item;
     });
 
@@ -64,10 +67,11 @@ export async function GET(
     });
   } catch (error: any) {
     console.error('Error fetching patient prescriptions:', error);
-    return NextResponse.json(
-      { success: false, error: 'Database error fetching prescription records.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Database error fetching prescription records.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
@@ -77,11 +81,11 @@ export async function POST(
   { params }: { params: Promise<{ patientId: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { patientId } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
     body.patientId = patientId;
@@ -96,11 +100,7 @@ export async function POST(
     }
 
     const rxData = validation.data;
-
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId }, { _id: isValidObjectId ? patientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       return NextResponse.json(
@@ -109,24 +109,14 @@ export async function POST(
       );
     }
 
-    const settings = await ClinicSettings.findOne();
-    const count = await Prescription.countDocuments();
-    let candidateNum = 901 + count;
-    let prescriptionId = `RX-${candidateNum}`;
-
-    while (await Prescription.exists({ prescriptionId })) {
-      candidateNum++;
-      prescriptionId = `RX-${candidateNum}`;
-    }
-
+    const settings = await getClinicSettings();
     const doctorId = auth.session?.userId || rxData.doctorId || 'USR-001';
     const doctorName = auth.session?.name || rxData.doctorName || 'DR SHAHAB MUHAMMAD';
-    const doctorLicense = rxData.doctorLicense || settings?.licenseNumber || 'NY-MED-849201';
-    const prescriptionDate = rxData.prescriptionDate || rxData.dateIssued || new Date().toISOString().split('T')[0];
+    const prescriptionDate =
+      rxData.prescriptionDate || rxData.dateIssued || new Date().toISOString().split('T')[0];
 
-    const newPrescription = new Prescription({
+    const created = await createPrescription({
       ...rxData,
-      prescriptionId,
       patientId: patient.patientId,
       patientName: patient.fullName,
       patientAge: patient.age,
@@ -135,32 +125,34 @@ export async function POST(
       doctorName,
       clinicianId: doctorId,
       clinicianName: doctorName,
-      doctorLicense,
+      doctorLicense: rxData.doctorLicense || settings.licenseNumber || 'NY-MED-849201',
       prescriptionDate,
       dateIssued: prescriptionDate,
     });
 
-    await newPrescription.save();
-
-    const formatted = {
-      ...newPrescription.toObject(),
-      id: newPrescription.prescriptionId,
-      dateIssued: newPrescription.prescriptionDate,
-    };
+    await auditFromSession(auth.session, {
+      action: 'CREATE',
+      module: 'PRESCRIPTIONS',
+      resourceType: 'PRESCRIPTION',
+      resourceId: created.prescriptionId,
+      patientRef: patient.patientId,
+      description: `Issued prescription ${created.prescriptionId} for ${patient.fullName}`,
+    });
 
     return NextResponse.json(
       {
         success: true,
-        data: formatted,
-        message: `Prescription ${prescriptionId} issued successfully for ${patient.fullName}`,
+        data: formatPrescription(created),
+        message: `Prescription ${created.prescriptionId} issued successfully for ${patient.fullName}`,
       },
       { status: 201 }
     );
   } catch (error: any) {
     console.error('Error issuing prescription:', error);
-    return NextResponse.json(
-      { success: false, error: 'Database error creating prescription record.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Database error creating prescription record.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

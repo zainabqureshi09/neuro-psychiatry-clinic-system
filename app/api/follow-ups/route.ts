@@ -1,62 +1,65 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import FollowUp from '@/models/FollowUp';
-import Patient from '@/models/Patient';
+﻿import { NextResponse } from 'next/server';
 import { FollowUpSchema } from '@/lib/validators';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import {
+  listFollowUps,
+  createFollowUp,
+  updateFollowUp,
+  deriveFollowUpStatus,
+} from '@/lib/db/repositories/followUpRepository';
+import { getPatientById } from '@/lib/db/repositories/patientRepository';
+import { auditFromSession } from '@/lib/audit';
+
+function formatFollowUp(followUp: any) {
+  return {
+    ...followUp,
+    id: followUp.followUpId,
+    dueDate: followUp.followUpDate,
+  };
+}
 
 // GET /api/follow-ups - List follow-ups with auto status calculation
 export async function GET(req: Request) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
-    await dbConnect();
+    await ensureDatabaseReady();
     const { searchParams } = new URL(req.url);
     const statusParam = searchParams.get('status');
     const patientId = searchParams.get('patientId');
 
     const todayStr = new Date().toISOString().split('T')[0];
+    const rawFollowUps = await listFollowUps();
 
-    // First fetch all follow-ups to compute dynamic date status (Due, Upcoming, Overdue)
-    const rawFollowUps = await FollowUp.find().sort({ followUpDate: 1 }).lean();
+    // Recalculate date-derived statuses and persist the changes
+    const synced = await Promise.all(
+      rawFollowUps.map(async (followUp) => {
+        const derived = deriveFollowUpStatus(followUp.followUpDate, followUp.status, todayStr);
 
-    // Auto update status based on date if not already marked Completed
-    const updatedFollowUps = await Promise.all(
-      rawFollowUps.map(async (f) => {
-        let currentStatus = f.status;
-        if (currentStatus !== 'Completed' && currentStatus !== 'COMPLETED') {
-          if (f.followUpDate === todayStr) {
-            currentStatus = 'Due';
-          } else if (f.followUpDate < todayStr) {
-            currentStatus = 'Overdue';
-          } else {
-            currentStatus = 'Upcoming';
-          }
-
-          if (currentStatus !== f.status) {
-            await FollowUp.updateOne({ _id: f._id }, { status: currentStatus });
+        if (derived !== followUp.status) {
+          try {
+            await updateFollowUp(followUp.followUpId, { status: derived });
+          } catch (syncError: any) {
+            console.error('[FollowUps] Unable to sync status:', syncError?.message || syncError);
           }
         }
 
-        return {
-          ...f,
-          id: f.followUpId,
-          dueDate: f.followUpDate,
-          status: currentStatus,
-        };
+        return formatFollowUp({ ...followUp, status: derived });
       })
     );
 
-    let filtered = updatedFollowUps;
+    let filtered = synced;
 
     if (patientId) {
-      filtered = filtered.filter(f => f.patientId === patientId);
+      filtered = filtered.filter((f) => f.patientId === patientId);
     }
 
     if (statusParam && statusParam !== 'All') {
       const targetStatus = statusParam.toLowerCase();
-      filtered = filtered.filter(f => f.status.toLowerCase() === targetStatus);
+      filtered = filtered.filter((f) => String(f.status).toLowerCase() === targetStatus);
     }
 
     return NextResponse.json({
@@ -65,20 +68,21 @@ export async function GET(req: Request) {
     });
   } catch (error: any) {
     console.error('Error fetching follow-ups:', error);
-    return NextResponse.json(
-      { success: false, error: 'Database error fetching follow-up tasks.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Database error fetching follow-up tasks.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
 // POST /api/follow-ups - Create follow-up entry
 export async function POST(req: Request) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
     if (body.dueDate && !body.followUpDate) body.followUpDate = body.dueDate;
@@ -92,7 +96,7 @@ export async function POST(req: Request) {
     }
 
     const flpData = validation.data;
-    const patient = await Patient.findOne({ patientId: flpData.patientId });
+    const patient = await getPatientById(flpData.patientId);
     if (!patient) {
       return NextResponse.json(
         { success: false, error: `Patient ${flpData.patientId} not found.` },
@@ -100,45 +104,38 @@ export async function POST(req: Request) {
       );
     }
 
-    const count = await FollowUp.countDocuments();
-    const followUpId = `FLP-${300 + count + 1}`;
     const followUpDate = flpData.followUpDate || flpData.dueDate || new Date().toISOString().split('T')[0];
+    const status = deriveFollowUpStatus(followUpDate, flpData.status);
 
-    const todayStr = new Date().toISOString().split('T')[0];
-    let status = flpData.status || 'Upcoming';
-    if (status !== 'Completed' && status !== 'COMPLETED') {
-      if (followUpDate === todayStr) status = 'Due';
-      else if (followUpDate < todayStr) status = 'Overdue';
-      else status = 'Upcoming';
-    }
-
-    const newFollowUp = new FollowUp({
+    const created = await createFollowUp({
       ...flpData,
-      followUpId,
+      patientId: patient.patientId,
       patientName: patient.fullName,
       phone: patient.phone,
       followUpDate,
       status,
     });
 
-    await newFollowUp.save();
-
-    const formatted = {
-      ...newFollowUp.toObject(),
-      id: newFollowUp.followUpId,
-      dueDate: newFollowUp.followUpDate,
-    };
+    await auditFromSession(auth.session, {
+      action: 'CREATE',
+      module: 'FOLLOW_UPS',
+      resourceType: 'FOLLOW_UP',
+      resourceId: created.followUpId,
+      patientRef: patient.patientId,
+      description: `Created follow-up ${created.followUpId} for ${patient.fullName} due ${followUpDate}`,
+    });
 
     return NextResponse.json({
       success: true,
-      data: formatted,
+      data: formatFollowUp(created),
       message: `Follow-up created for ${patient.fullName} due on ${followUpDate}`,
     });
   } catch (error: any) {
     console.error('Error creating follow-up:', error);
-    return NextResponse.json(
-      { success: false, error: 'Failed to create follow-up task.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to create follow-up task.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

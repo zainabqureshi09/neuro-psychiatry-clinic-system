@@ -1,7 +1,8 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import Prescription from '@/models/Prescription';
+﻿import { NextResponse } from 'next/server';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import { getPrescriptionById } from '@/lib/db/repositories/prescriptionRepository';
 
 // GET /api/prescriptions/[id]
 export async function GET(
@@ -9,15 +10,13 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { id } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
 
-    const prescription = await Prescription.findOne({
-      $or: [{ prescriptionId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
-    }).lean();
+    const prescription = await getPrescriptionById(id);
 
     if (!prescription) {
       return NextResponse.json(
@@ -36,9 +35,11 @@ export async function GET(
       },
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to fetch prescription details.' },
-      { status: 500 }
+    console.error('Error fetching prescription:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to fetch prescription details.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

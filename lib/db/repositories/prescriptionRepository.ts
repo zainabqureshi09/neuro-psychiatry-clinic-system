@@ -25,6 +25,8 @@ export interface PrescriptionRecord {
   instructions?: string;
   notes?: string;
   status: 'Active' | 'Completed' | 'Discontinued';
+  createdBy?: string;
+  updatedBy?: string;
   createdAt?: string | Date;
   updatedAt?: string | Date;
 }

@@ -107,3 +107,25 @@ export async function query<R extends QueryResultRow = any>(
   }
   return currentPool.query<R>(text, params);
 }
+
+/**
+ * Verifies that the configured pool can actually serve a trivial query.
+ * Used by health/diagnostics endpoints - never throws.
+ */
+export async function checkPostgresConnection(): Promise<boolean> {
+  const currentPool = getPostgresPool();
+  if (!currentPool) return false;
+
+  try {
+    const client = await currentPool.connect();
+    try {
+      await client.query('SELECT 1');
+      return true;
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('[PostgreSQL Pool] Health check failed:', err?.message || err);
+    return false;
+  }
+}

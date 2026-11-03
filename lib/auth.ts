@@ -3,9 +3,16 @@ import { SignJWT, jwtVerify } from 'jose';
 import { cookies, headers } from 'next/headers';
 import { UserRole } from '@/models/User';
 
-const SESSION_SECRET = process.env.SESSION_SECRET || 'psychiatrist_system_secure_jwt_session_secret_32chars_min';
-const SECRET_KEY = new TextEncoder().encode(SESSION_SECRET);
 const COOKIE_NAME = 'psychiatrist_session';
+
+/**
+ * Resolves the signing secret lazily so that tests and runtime environment
+ * changes are always respected (and production misconfiguration is caught).
+ */
+function getSecretKey(): Uint8Array {
+  const secret = process.env.SESSION_SECRET || 'psychiatrist_system_secure_jwt_session_secret_32chars_min';
+  return new TextEncoder().encode(secret);
+}
 
 export interface SessionPayload {
   userId: string;
@@ -38,7 +45,7 @@ export async function createSessionCookie(payload: Omit<SessionPayload, 'exp'>):
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
     .setExpirationTime('1d') // Session expires in 24 hours
-    .sign(SECRET_KEY);
+    .sign(getSecretKey());
 
   const cookieStore = await cookies();
   cookieStore.set(COOKIE_NAME, token, {
@@ -85,7 +92,7 @@ export async function getSession(req?: Request): Promise<SessionPayload | null> 
 
     if (!token) return null;
 
-    const { payload } = await jwtVerify(token, SECRET_KEY);
+    const { payload } = await jwtVerify(token, getSecretKey());
     return payload as unknown as SessionPayload;
   } catch {
     return null;

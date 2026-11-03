@@ -1,8 +1,8 @@
 import { Request, Response } from "express";
-import { isDatabaseConnected } from "../config/database";
+import { getBackendDatabaseHealth } from "../config/database";
 
-export const getHealthStatus = (_req: Request, res: Response): void => {
-  const dbConnected = isDatabaseConnected();
+export const getHealthStatus = async (_req: Request, res: Response): Promise<void> => {
+  const database = await getBackendDatabaseHealth();
 
   res.status(200).json({
     success: true,
@@ -10,8 +10,11 @@ export const getHealthStatus = (_req: Request, res: Response): void => {
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || "development",
     database: {
-      status: dbConnected ? "connected" : "disconnected",
-      ready: dbConnected,
+      provider: database.provider,
+      status: database.status,
+      ready: database.ready,
+      transactions: database.transactions,
     },
   });
 };
+

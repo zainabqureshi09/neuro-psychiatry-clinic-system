@@ -124,7 +124,11 @@ export async function listAppointments(filter: {
   patientId?: string;
   doctorId?: string;
   date?: string;
+  startDate?: string;
+  endDate?: string;
   status?: string;
+  excludeStatuses?: string[];
+  type?: string;
   search?: string;
 } = {}): Promise<AppointmentRecord[]> {
   const supabase = getSupabaseClient();
@@ -134,7 +138,19 @@ export async function listAppointments(filter: {
     if (filter.patientId) query = query.eq('patient_id', filter.patientId);
     if (filter.doctorId) query = query.or(`doctor_id.eq.${filter.doctorId},clinician_id.eq.${filter.doctorId}`);
     if (filter.date) query = query.eq('appointment_date', filter.date);
+    if (filter.startDate) query = query.gte('appointment_date', filter.startDate);
+    if (filter.endDate) query = query.lte('appointment_date', filter.endDate);
     if (filter.status && filter.status !== 'All') query = query.eq('status', filter.status);
+    if (filter.excludeStatuses && filter.excludeStatuses.length > 0) {
+      query = query.not('status', 'in', `(${filter.excludeStatuses.map((s) => `"${s}"`).join(',')})`);
+    }
+    if (filter.type) query = query.ilike('appointment_type', `%${filter.type}%`);
+    if (filter.search) {
+      const term = filter.search;
+      query = query.or(
+        `patient_name.ilike.%${term}%,patient_id.ilike.%${term}%,appointment_type.ilike.%${term}%,doctor_name.ilike.%${term}%`
+      );
+    }
 
     query = query.order('appointment_date', { ascending: false }).order('appointment_time', { ascending: true });
 
@@ -151,8 +167,27 @@ export async function listAppointments(filter: {
   if (filter.doctorId) {
     mongoFilter.$or = [{ doctorId: filter.doctorId }, { clinicianId: filter.doctorId }];
   }
-  if (filter.date) mongoFilter.appointmentDate = filter.date;
+  if (filter.date) {
+    mongoFilter.appointmentDate = filter.date;
+  } else if (filter.startDate || filter.endDate) {
+    mongoFilter.appointmentDate = {};
+    if (filter.startDate) mongoFilter.appointmentDate.$gte = filter.startDate;
+    if (filter.endDate) mongoFilter.appointmentDate.$lte = filter.endDate;
+  }
   if (filter.status && filter.status !== 'All') mongoFilter.status = filter.status;
+  if (filter.excludeStatuses && filter.excludeStatuses.length > 0) {
+    mongoFilter.status = { $nin: filter.excludeStatuses };
+  }
+  if (filter.type) mongoFilter.appointmentType = new RegExp(filter.type, 'i');
+  if (filter.search) {
+    const searchRegex = new RegExp(filter.search, 'i');
+    mongoFilter.$or = [
+      { patientName: searchRegex },
+      { patientId: searchRegex },
+      { appointmentType: searchRegex },
+      { doctorName: searchRegex },
+    ];
+  }
 
   const docs = await Appointment.find(mongoFilter).sort({ appointmentDate: -1, appointmentTime: 1 }).lean();
   return docs.map((d: any) => ({

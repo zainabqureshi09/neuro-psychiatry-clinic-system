@@ -1,7 +1,23 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import Appointment from '@/models/Appointment';
+﻿import { NextResponse } from 'next/server';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import {
+  getAppointmentById,
+  updateAppointment,
+  deleteAppointment,
+} from '@/lib/db/repositories/appointmentRepository';
+import { auditFromSession } from '@/lib/audit';
+
+function formatAppointment(appointment: any) {
+  return {
+    ...appointment,
+    id: appointment.appointmentId,
+    date: appointment.appointmentDate,
+    time: appointment.appointmentTime,
+    type: appointment.appointmentType,
+  };
+}
 
 // GET /api/appointments/[id]
 export async function GET(
@@ -9,15 +25,13 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { id } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
 
-    const appointment = await Appointment.findOne({
-      $or: [{ appointmentId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
-    }).lean();
+    const appointment = await getAppointmentById(id);
 
     if (!appointment) {
       return NextResponse.json(
@@ -28,19 +42,15 @@ export async function GET(
 
     return NextResponse.json({
       success: true,
-      data: {
-        ...appointment,
-        id: appointment.appointmentId,
-        date: appointment.appointmentDate,
-        time: appointment.appointmentTime,
-        type: appointment.appointmentType,
-      },
+      data: formatAppointment(appointment),
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to fetch appointment detail.' },
-      { status: 500 }
+    console.error('Error fetching appointment:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to fetch appointment detail.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
@@ -50,16 +60,25 @@ export async function PUT(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { id } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
-    const appointment = await Appointment.findOne({
-      $or: [{ appointmentId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
-    });
+    const updates: Record<string, any> = {
+      updatedBy: auth.session?.userId || 'SYSTEM',
+    };
+
+    if (body.status) updates.status = body.status;
+    if (body.notes !== undefined) updates.notes = body.notes;
+    if (body.room !== undefined) updates.room = body.room;
+    if (body.date) updates.appointmentDate = body.date;
+    if (body.time) updates.appointmentTime = body.time;
+    if (body.type) updates.appointmentType = body.type;
+
+    const appointment = await updateAppointment(id, updates);
 
     if (!appointment) {
       return NextResponse.json(
@@ -68,28 +87,27 @@ export async function PUT(
       );
     }
 
-    if (body.status) appointment.status = body.status;
-    if (body.notes !== undefined) appointment.notes = body.notes;
-    if (body.room !== undefined) appointment.room = body.room;
-
-    await appointment.save();
+    await auditFromSession(auth.session, {
+      action: 'UPDATE',
+      module: 'APPOINTMENTS',
+      resourceType: 'APPOINTMENT',
+      resourceId: appointment.appointmentId,
+      patientRef: appointment.patientId,
+      description: `Updated appointment ${appointment.appointmentId} to status ${appointment.status}`,
+    });
 
     return NextResponse.json({
       success: true,
-      data: {
-        ...appointment.toObject(),
-        id: appointment.appointmentId,
-        date: appointment.appointmentDate,
-        time: appointment.appointmentTime,
-        type: appointment.appointmentType,
-      },
+      data: formatAppointment(appointment),
       message: `Appointment ${appointment.appointmentId} updated to ${appointment.status}`,
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to update appointment.' },
-      { status: 500 }
+    console.error('Error updating appointment:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to update appointment.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
@@ -99,16 +117,13 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { id } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
 
-    const appointment = await Appointment.findOneAndDelete({
-      $or: [{ appointmentId: id }, { _id: id.match(/^[0-9a-fA-F]{24}$/) ? id : null }],
-    });
-
+    const appointment = await getAppointmentById(id);
     if (!appointment) {
       return NextResponse.json(
         { success: false, error: 'Appointment not found' },
@@ -116,14 +131,33 @@ export async function DELETE(
       );
     }
 
+    const deleted = await deleteAppointment(id);
+    if (!deleted) {
+      return NextResponse.json(
+        { success: false, error: 'Failed to delete appointment.' },
+        { status: 500 }
+      );
+    }
+
+    await auditFromSession(auth.session, {
+      action: 'DELETE',
+      module: 'APPOINTMENTS',
+      resourceType: 'APPOINTMENT',
+      resourceId: appointment.appointmentId,
+      patientRef: appointment.patientId,
+      description: `Deleted appointment ${appointment.appointmentId} (${appointment.appointmentDate} ${appointment.appointmentTime})`,
+    });
+
     return NextResponse.json({
       success: true,
       message: `Appointment ${appointment.appointmentId} deleted.`,
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to delete appointment.' },
-      { status: 500 }
+    console.error('Error deleting appointment:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to delete appointment.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

@@ -1,104 +1,29 @@
 import { Request, Response, NextFunction } from "express";
-import Appointment, { IAppointment } from "../../models/Appointment";
-import Patient from "../../models/Patient";
-import User from "../../models/User";
 import { createAppointmentSchema, updateAppointmentSchema } from "../utils/appointmentValidation";
 import { recordAuditEvent } from "../utils/auditLogger";
+import {
+  listAppointments,
+  getAppointmentById as getAppointmentRecord,
+  createAppointment as createAppointmentRecord,
+  updateAppointment as updateAppointmentRecord,
+  checkClinicianConflict,
+  timeToMinutes,
+} from "../../lib/db/repositories/appointmentRepository";
+import { getPatientById } from "../../lib/db/repositories/patientRepository";
+import { findUserById } from "../../lib/db/repositories/userRepository";
 
-/**
- * Helper to convert HH:MM AM/PM or HH:MM to minutes from midnight
- */
-export const timeToMinutes = (timeStr: string): number => {
-  if (!timeStr) return 0;
-  const cleanStr = timeStr.trim();
-
-  // 24hr format like "18:30"
-  if (/^\d{1,2}:\d{2}$/.test(cleanStr)) {
-    const [h, m] = cleanStr.split(":").map(Number);
-    return h * 60 + m;
-  }
-
-  // 12hr format like "06:00 PM" or "09:30 AM"
-  const match = cleanStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-  if (!match) return 0;
-
-  let hours = parseInt(match[1], 10);
-  const minutes = parseInt(match[2], 10);
-  const period = match[3].toUpperCase();
-
-  if (period === "PM" && hours < 12) hours += 12;
-  if (period === "AM" && hours === 12) hours = 0;
-
-  return hours * 60 + minutes;
-};
-
-/**
- * Helper to generate sequential Appointment ID (APT-XXXX)
- */
-const generateAppointmentId = async (): Promise<string> => {
-  const count = await Appointment.countDocuments();
-  let candidateNum = 1001 + count;
-  let candidateId = `APT-${candidateNum}`;
-
-  while (await Appointment.exists({ appointmentId: candidateId })) {
-    candidateNum++;
-    candidateId = `APT-${candidateNum}`;
-  }
-
-  return candidateId;
-};
-
-/**
- * Helper to check for overlapping appointments for the same clinician
- */
-export const checkClinicianConflict = async (
-  doctorId: string,
-  appointmentDate: string,
-  appointmentTime: string,
-  durationMinutes: number = 45,
-  excludeAppointmentId?: string
-): Promise<boolean> => {
-  if (!doctorId || !appointmentDate || !appointmentTime) return false;
-
-  const newStart = timeToMinutes(appointmentTime);
-  const newEnd = newStart + durationMinutes;
-
-  const existingAppts = await Appointment.find({
-    $or: [{ doctorId }, { clinicianId: doctorId }],
-    appointmentDate,
-    status: { $nin: ["Cancelled", "CANCELLED"] },
-  });
-
-  for (const appt of existingAppts) {
-    if (excludeAppointmentId && (appt.appointmentId === excludeAppointmentId || appt._id.toString() === excludeAppointmentId)) {
-      continue;
-    }
-
-    const apptStart = timeToMinutes(appt.appointmentTime);
-    const apptEnd = apptStart + (appt.durationMinutes || 45);
-
-    // Overlap condition: start1 < end2 AND start2 < end1
-    if (newStart < apptEnd && apptStart < newEnd) {
-      return true; // Overlap detected
-    }
-  }
-
-  return false;
-};
+export { timeToMinutes, checkClinicianConflict };
 
 /**
  * Helper to format appointment response for UI compatibility
  */
-const formatAppointmentResponse = (appt: any) => {
-  const obj = typeof appt.toObject === "function" ? appt.toObject() : { ...appt };
-  return {
-    ...obj,
-    id: obj.appointmentId || obj.id || obj._id,
-    date: obj.appointmentDate || obj.date,
-    time: obj.appointmentTime || obj.time,
-    type: obj.appointmentType || obj.type,
-  };
-};
+const formatAppointmentResponse = (appt: any) => ({
+  ...appt,
+  id: appt.appointmentId || appt.id,
+  date: appt.appointmentDate || appt.date,
+  time: appt.appointmentTime || appt.time,
+  type: appt.appointmentType || appt.type,
+});
 
 /**
  * GET /api/appointments (and GET /api/patients/:patientId/appointments)
@@ -115,19 +40,16 @@ export const getAppointments = async (
     const dateParam = (req.query.date as string) || (req.query.appointmentDate as string);
     const startDateParam = req.query.startDate as string;
     const endDateParam = req.query.endDate as string;
-    const clinicianParam = (req.query.clinicianId as string) || (req.query.doctorId as string) || (req.query.clinician as string);
+    const clinicianParam =
+      (req.query.clinicianId as string) || (req.query.doctorId as string) || (req.query.clinician as string);
     const statusParam = req.query.status as string;
     const typeParam = (req.query.type as string) || (req.query.appointmentType as string);
     const searchParam = req.query.search as string;
 
-    const filter: Record<string, any> = {};
+    let scopedPatientId: string | undefined;
 
     if (patientIdParam) {
-      const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(patientIdParam);
-      const patient = await Patient.findOne({
-        $or: [{ patientId: patientIdParam }, { _id: isValidObjectId ? patientIdParam : null }],
-      });
-
+      const patient = await getPatientById(patientIdParam);
       if (!patient) {
         res.status(404).json({
           success: false,
@@ -135,65 +57,34 @@ export const getAppointments = async (
         });
         return;
       }
-      filter.patientId = patient.patientId;
+      scopedPatientId = patient.patientId;
     }
 
-    if (dateParam) {
-      filter.appointmentDate = dateParam;
-    } else if (startDateParam || endDateParam) {
-      filter.appointmentDate = {};
-      if (startDateParam) filter.appointmentDate.$gte = startDateParam;
-      if (endDateParam) filter.appointmentDate.$lte = endDateParam;
+    const todayStr = new Date().toISOString().split("T")[0];
+    const filter: Parameters<typeof listAppointments>[0] = {
+      patientId: scopedPatientId,
+      doctorId: clinicianParam || undefined,
+      date: dateParam || undefined,
+      startDate: startDateParam || undefined,
+      endDate: endDateParam || undefined,
+      type: typeParam || undefined,
+      search: searchParam || undefined,
+      status: statusParam && statusParam !== "Today" && statusParam !== "Upcoming" ? statusParam : undefined,
+    };
+
+    if (statusParam === "Today") {
+      filter.date = todayStr;
+    } else if (statusParam === "Upcoming") {
+      filter.startDate = todayStr;
+      filter.excludeStatuses = ["Completed", "COMPLETED", "Cancelled", "CANCELLED"];
     }
 
-    if (clinicianParam) {
-      filter.$or = [{ doctorId: clinicianParam }, { clinicianId: clinicianParam }];
+    // Role-based scoping for DOCTOR
+    if (req.user?.role === "DOCTOR" && !filter.doctorId) {
+      filter.doctorId = req.user.userId;
     }
 
-    if (statusParam) {
-      if (statusParam === "Today") {
-        filter.appointmentDate = new Date().toISOString().split("T")[0];
-      } else if (statusParam === "Upcoming") {
-        const todayStr = new Date().toISOString().split("T")[0];
-        filter.appointmentDate = { $gte: todayStr };
-        filter.status = { $nin: ["Completed", "COMPLETED", "Cancelled", "CANCELLED"] };
-      } else {
-        filter.status = statusParam;
-      }
-    }
-
-    if (typeParam) {
-      filter.appointmentType = new RegExp(typeParam, "i");
-    }
-
-    if (searchParam) {
-      const searchRegex = new RegExp(searchParam, "i");
-      filter.$or = [
-        { patientName: searchRegex },
-        { patientId: searchRegex },
-        { appointmentType: searchRegex },
-        { doctorName: searchRegex },
-      ];
-    }
-
-    // Role-based scoping for DOCTOR and THERAPIST
-    if (req.user?.role === "DOCTOR") {
-      const doctorUser = await User.findOne({
-        $or: [{ userId: req.user.userId }, { email: req.user.email }],
-      });
-      const docName = doctorUser?.name || req.user.name;
-      const docId = doctorUser?.userId || req.user.userId;
-
-      if (!filter.$or) {
-        filter.$or = [
-          { doctorId: docId },
-          { clinicianId: docId },
-          { doctorName: new RegExp(docName, "i") },
-        ];
-      }
-    }
-
-    const appointments = await Appointment.find(filter).sort({ appointmentDate: -1, appointmentTime: 1, createdAt: -1 });
+    const appointments = await listAppointments(filter);
 
     res.status(200).json({
       success: true,
@@ -217,11 +108,8 @@ export const getAppointmentById = async (
   try {
     const rawId = req.params.id || req.params.appointmentId;
     const id = Array.isArray(rawId) ? rawId[0] : (rawId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const appt = await Appointment.findOne({
-      $or: [{ appointmentId: id }, { _id: isValidObjectId ? id : null }],
-    });
+    const appt = await getAppointmentRecord(id);
 
     if (!appt) {
       res.status(404).json({
@@ -231,12 +119,14 @@ export const getAppointmentById = async (
       return;
     }
 
-    if (req.params.patientId && appt.patientId !== req.params.patientId) {
-      const patient = await Patient.findOne({ patientId: req.params.patientId });
+    const rawPatientId = req.params.patientId;
+    const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : rawPatientId;
+    if (patientId && appt.patientId !== patientId) {
+      const patient = await getPatientById(patientId);
       if (!patient || appt.patientId !== patient.patientId) {
         res.status(404).json({
           success: false,
-          error: `Appointment ${id} does not belong to patient ${req.params.patientId}`,
+          error: `Appointment ${id} does not belong to patient ${patientId}`,
         });
         return;
       }
@@ -272,12 +162,11 @@ export const createAppointment = async (
 
     const data = parsed.data;
     const rawTargetPatientId = req.params.patientId || data.patientId;
-    const targetPatientId = Array.isArray(rawTargetPatientId) ? rawTargetPatientId[0] : (rawTargetPatientId as string);
+    const targetPatientId = Array.isArray(rawTargetPatientId)
+      ? rawTargetPatientId[0]
+      : (rawTargetPatientId as string);
 
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetPatientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId: targetPatientId }, { _id: isValidObjectId ? targetPatientId : null }],
-    });
+    const patient = await getPatientById(targetPatientId);
 
     if (!patient) {
       res.status(404).json({
@@ -291,14 +180,14 @@ export const createAppointment = async (
     let doctorId = data.doctorId || data.clinicianId || req.user?.userId || "USR-001";
     let doctorName = data.doctorName || data.clinicianName || req.user?.name || "DR SHAHAB MUHAMMAD";
 
-    const clinicianUser = await User.findOne({
-      $or: [{ userId: doctorId }, { _id: /^[0-9a-fA-F]{24}$/.test(doctorId) ? doctorId : null }],
-    });
+    const clinicianUser = await findUserById(doctorId);
 
     if (clinicianUser) {
       doctorId = clinicianUser.userId;
       doctorName = clinicianUser.name;
-    } else if (doctorId === "invalid-clinician" || doctorId === "PX-99999") {
+    } else if (data.doctorId || data.clinicianId) {
+      // Preserve the legacy contract: an explicitly supplied but unknown
+      // clinician identifier is rejected with 404 instead of silently coercing.
       res.status(404).json({
         success: false,
         error: `Clinician not found for ID: ${doctorId}`,
@@ -308,9 +197,8 @@ export const createAppointment = async (
 
     const appointmentDate = data.appointmentDate;
     const appointmentTime = data.appointmentTime;
-    const durationMinutes = data.durationMinutes || (data.appointmentType?.includes("Eval") ? 60 : 45);
+    const durationMinutes = data.durationMinutes || 45;
 
-    // Conflict Check (Double Booking Prevention)
     const hasConflict = await checkClinicianConflict(
       doctorId,
       appointmentDate,
@@ -326,11 +214,10 @@ export const createAppointment = async (
       return;
     }
 
-    const appointmentId = await generateAppointmentId();
     const createdBy = req.user?.userId || req.user?.name || "RECEPTION";
 
-    const newAppointment = new Appointment({
-      appointmentId,
+    const newAppointment = await createAppointmentRecord({
+      appointmentId: (data as any).appointmentId,
       patientId: patient.patientId,
       patientName: patient.fullName,
       patientPhone: patient.phone,
@@ -350,28 +237,20 @@ export const createAppointment = async (
       createdBy,
     });
 
-    await newAppointment.save();
-
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: "CREATE",
-        module: "APPOINTMENT",
-        resourceId: appointmentId,
-        patientRef: patient.patientId,
-        description: `Booked ${newAppointment.appointmentType} appointment ${appointmentId} for ${patient.fullName} on ${appointmentDate} at ${appointmentTime}`,
-      });
-    }
-
-    // Update patient's next follow-up date
-    patient.nextFollowUpDate = appointmentDate;
-    await patient.save();
+    await recordAuditEvent({
+      userId: req.user?.userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "CREATE",
+      module: "APPOINTMENT",
+      resourceId: newAppointment.appointmentId,
+      patientRef: patient.patientId,
+      description: `Booked ${newAppointment.appointmentType} appointment ${newAppointment.appointmentId} for ${patient.fullName} on ${appointmentDate} at ${appointmentTime}`,
+    });
 
     res.status(201).json({
       success: true,
-      message: `Appointment ${appointmentId} confirmed for ${patient.fullName} on ${appointmentDate} at ${appointmentTime}.`,
+      message: `Appointment ${newAppointment.appointmentId} confirmed for ${patient.fullName} on ${appointmentDate} at ${appointmentTime}.`,
       data: formatAppointmentResponse(newAppointment),
     });
   } catch (error) {
@@ -391,11 +270,8 @@ export const updateAppointment = async (
   try {
     const rawId = req.params.id || req.params.appointmentId;
     const id = Array.isArray(rawId) ? rawId[0] : (rawId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const appt = await Appointment.findOne({
-      $or: [{ appointmentId: id }, { _id: isValidObjectId ? id : null }],
-    });
+    const appt = await getAppointmentRecord(id);
 
     if (!appt) {
       res.status(404).json({
@@ -420,8 +296,8 @@ export const updateAppointment = async (
     const newDoctorId = updates.doctorId || updates.clinicianId || appt.doctorId;
     const newDuration = updates.durationMinutes || appt.durationMinutes;
 
-    // Check if rescheduling date, time or doctor changed
-    const isRescheduled = newDate !== appt.appointmentDate || newTime !== appt.appointmentTime || newDoctorId !== appt.doctorId;
+    const isRescheduled =
+      newDate !== appt.appointmentDate || newTime !== appt.appointmentTime || newDoctorId !== appt.doctorId;
 
     if (isRescheduled) {
       const hasConflict = await checkClinicianConflict(
@@ -441,31 +317,34 @@ export const updateAppointment = async (
       }
     }
 
-    if (updates.appointmentDate || updates.date) appt.appointmentDate = newDate;
-    if (updates.appointmentTime || updates.time) appt.appointmentTime = newTime;
-    if (updates.durationMinutes) appt.durationMinutes = newDuration;
+    const patch: Record<string, any> = {
+      updatedBy: req.user?.userId || req.user?.name || "RECEPTION",
+    };
+
+    if (updates.appointmentDate || updates.date) patch.appointmentDate = newDate;
+    if (updates.appointmentTime || updates.time) patch.appointmentTime = newTime;
+    if (updates.durationMinutes) patch.durationMinutes = newDuration;
     if (updates.doctorId || updates.clinicianId) {
-      appt.doctorId = newDoctorId;
-      appt.clinicianId = newDoctorId;
+      patch.doctorId = newDoctorId;
+      patch.clinicianId = newDoctorId;
     }
     if (updates.doctorName || updates.clinicianName) {
-      appt.doctorName = updates.doctorName || updates.clinicianName;
-      appt.clinicianName = appt.doctorName;
+      patch.doctorName = updates.doctorName || updates.clinicianName;
+      patch.clinicianName = patch.doctorName;
     }
-    if (updates.appointmentType || updates.type) appt.appointmentType = updates.appointmentType || updates.type;
-    if (updates.notes !== undefined) appt.notes = updates.notes;
-    if (updates.room !== undefined) appt.room = updates.room;
-    if (updates.consultationMode !== undefined) appt.consultationMode = updates.consultationMode;
-    if (updates.onlineSessionLink !== undefined) appt.onlineSessionLink = updates.onlineSessionLink;
-    if (updates.status) appt.status = updates.status;
+    if (updates.appointmentType || updates.type) patch.appointmentType = updates.appointmentType || updates.type;
+    if (updates.notes !== undefined) patch.notes = updates.notes;
+    if (updates.room !== undefined) patch.room = updates.room;
+    if (updates.consultationMode !== undefined) patch.consultationMode = updates.consultationMode;
+    if (updates.onlineSessionLink !== undefined) patch.onlineSessionLink = updates.onlineSessionLink;
+    if (updates.status) patch.status = updates.status;
 
-    appt.updatedBy = req.user?.userId || req.user?.name || "RECEPTION";
-    await appt.save();
+    const updated = (await updateAppointmentRecord(appt.appointmentId, patch)) || { ...appt, ...patch };
 
     res.status(200).json({
       success: true,
-      message: `Appointment ${appt.appointmentId} updated successfully.`,
-      data: formatAppointmentResponse(appt),
+      message: `Appointment ${updated.appointmentId} updated successfully.`,
+      data: formatAppointmentResponse(updated),
     });
   } catch (error) {
     next(error);
@@ -484,11 +363,8 @@ export const deleteAppointment = async (
   try {
     const rawId = req.params.id || req.params.appointmentId;
     const id = Array.isArray(rawId) ? rawId[0] : (rawId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const appt = await Appointment.findOne({
-      $or: [{ appointmentId: id }, { _id: isValidObjectId ? id : null }],
-    });
+    const appt = await getAppointmentRecord(id);
 
     if (!appt) {
       res.status(404).json({
@@ -498,13 +374,29 @@ export const deleteAppointment = async (
       return;
     }
 
-    appt.status = "Cancelled";
-    await appt.save();
+    // Appointments are cancelled rather than destroyed so scheduling history
+    // (and any linked billing/audit records) remains intact.
+    const cancelled =
+      (await updateAppointmentRecord(appt.appointmentId, {
+        status: "Cancelled",
+        updatedBy: req.user?.userId || "SYSTEM",
+      })) || { ...appt, status: "Cancelled" };
+
+    await recordAuditEvent({
+      userId: req.user?.userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "DELETE",
+      module: "APPOINTMENT",
+      resourceId: cancelled.appointmentId,
+      patientRef: cancelled.patientId,
+      description: `Cancelled appointment ${cancelled.appointmentId} for patient ${cancelled.patientName}`,
+    });
 
     res.status(200).json({
       success: true,
-      message: `Appointment ${appt.appointmentId} status changed to Cancelled.`,
-      data: formatAppointmentResponse(appt),
+      message: `Appointment ${cancelled.appointmentId} status changed to Cancelled.`,
+      data: formatAppointmentResponse(cancelled),
     });
   } catch (error) {
     next(error);

@@ -195,10 +195,17 @@ export async function listPatients(options: ListPatientsOptions = {}): Promise<{
 }
 
 /**
- * Find a patient by patientId (PX-XXXX) or internal UUID / ObjectId
+ * Find a patient by patientId (PX-XXXX) or internal UUID / ObjectId.
+ * `includeInactive` defaults to true so legacy chart reads keep working exactly
+ * as before; the Express API passes false to hide soft-deleted patients.
  */
-export async function getPatientById(id: string): Promise<PatientRecord | null> {
+export async function getPatientById(
+  id: string,
+  options: { includeInactive?: boolean } = {}
+): Promise<PatientRecord | null> {
   if (!id) return null;
+
+  const includeInactive = options.includeInactive !== false;
 
   const supabase = getSupabaseClient();
   if (supabase) {
@@ -211,6 +218,10 @@ export async function getPatientById(id: string): Promise<PatientRecord | null> 
       query = query.eq('patient_id', id);
     }
 
+    if (!includeInactive) {
+      query = query.eq('is_active', true);
+    }
+
     const { data, error } = await query.maybeSingle();
     if (error) {
       throw new Error(`Database error fetching patient ${id}: ${error.message}`);
@@ -220,10 +231,66 @@ export async function getPatientById(id: string): Promise<PatientRecord | null> 
 
   // Fallback: MongoDB
   const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
-  const doc = await Patient.findOne({
+  const mongoFilter: any = {
     $or: [{ patientId: id }, { _id: isValidObjectId ? id : null }],
-  }).lean();
+  };
+  if (!includeInactive) {
+    mongoFilter.isActive = { $ne: false };
+  }
 
+  const doc = await Patient.findOne(mongoFilter).lean();
+
+  if (!doc) return null;
+  return {
+    ...doc,
+    id: (doc as any).patientId || (doc as any)._id?.toString(),
+  } as PatientRecord;
+}
+
+/**
+ * Duplicate-patient guard (phone / CNIC) used before creating a chart.
+ * Returns the conflicting patient, or null when the chart is unique.
+ */
+export async function findPatientConflict(
+  phone?: string,
+  cnic?: string
+): Promise<PatientRecord | null> {
+  const cleanPhone = phone?.trim();
+  const cleanCnic = cnic?.trim();
+  if (!cleanPhone && !cleanCnic) return null;
+
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    const orParts: string[] = [];
+    if (cleanPhone) orParts.push(`phone.eq.${cleanPhone}`);
+    if (cleanCnic) orParts.push(`cnic.eq.${cleanCnic}`);
+
+    const { data, error } = await supabase
+      .from('patients')
+      .select('*')
+      .or(orParts.join(','))
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      // A missing `cnic` column is not fatal - fall back to a phone-only lookup.
+      if (!cleanPhone) return null;
+      const fallback = await supabase.from('patients').select('*').eq('phone', cleanPhone).limit(1).maybeSingle();
+      if (fallback.error) {
+        throw new Error(`Database error checking patient duplicates: ${fallback.error.message}`);
+      }
+      return mapPatientFromPg(fallback.data);
+    }
+
+    return mapPatientFromPg(data);
+  }
+
+  // Fallback: MongoDB
+  const orQuery: any[] = [];
+  if (cleanPhone) orQuery.push({ phone: cleanPhone });
+  if (cleanCnic) orQuery.push({ cnic: cleanCnic });
+
+  const doc = await Patient.findOne({ $or: orQuery }).lean();
   if (!doc) return null;
   return {
     ...doc,
@@ -234,9 +301,13 @@ export async function getPatientById(id: string): Promise<PatientRecord | null> 
 /**
  * Creates a new patient
  */
-export async function createPatient(data: Partial<PatientRecord>): Promise<PatientRecord> {
+export async function createPatient(
+  data: Partial<PatientRecord>,
+  createdBy: string = 'SYSTEM'
+): Promise<PatientRecord> {
   const patientId = data.patientId || (await generatePatientId());
   const registeredDate = data.registeredDate || new Date().toISOString().split('T')[0];
+  const auditCreator = data.createdBy || createdBy;
 
   const supabase = getSupabaseClient();
   if (supabase) {
@@ -256,8 +327,8 @@ export async function createPatient(data: Partial<PatientRecord>): Promise<Patie
       last_visit_date: data.lastVisitDate || 'N/A',
       next_follow_up_date: data.nextFollowUpDate || 'N/A',
       is_active: data.isActive !== undefined ? data.isActive : true,
-      created_by: data.createdBy || '',
-      updated_by: data.updatedBy || '',
+      created_by: auditCreator,
+      updated_by: data.updatedBy || auditCreator,
     };
 
     const { data: created, error } = await supabase
@@ -279,6 +350,7 @@ export async function createPatient(data: Partial<PatientRecord>): Promise<Patie
     patientId,
     registeredDate,
     isActive: data.isActive !== undefined ? data.isActive : true,
+    createdBy: auditCreator,
   });
 
   await newPatient.save();

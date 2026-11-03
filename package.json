@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "backend": "tsx backend/server.ts",
-    "test:backend": "tsx scripts/testAuth.ts"
+    "test:backend": "tsx scripts/testAuth.ts",
+    "test:postgres": "tsx scripts/testPhase14PostgresMigration.ts"
   },
   "dependencies": {
     "@supabase/server": "^1.9.2",

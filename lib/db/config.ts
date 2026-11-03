@@ -79,17 +79,34 @@ export function getDatabaseConfig(): DatabaseConfig {
 
   const isMongoConfigured = Boolean(mongoUri);
 
-  // Check explicit provider override
-  let provider: DatabaseProvider = 'mongodb';
+  /**
+   * Provider resolution (Phase Three, Option A):
+   *  - 'postgres' is the PostgreSQL stack: Supabase JS client for standard
+   *    operations + a `pg` Pool for atomic transactions (DATABASE_URL).
+   *  - 'mongodb' is the preserved legacy stack, used automatically whenever the
+   *    Supabase project is not configured (or is explicitly disabled).
+   *
+   * DATABASE_URL alone cannot serve standard reads, so it never selects the
+   * PostgreSQL stack on its own - the Supabase project must be configured.
+   */
   const explicitProvider = process.env.DB_PROVIDER?.toLowerCase();
+  let provider: DatabaseProvider;
 
-  if (explicitProvider === 'postgres' || explicitProvider === 'supabase') {
-    provider = explicitProvider;
-  } else if (isPostgresConfigured) {
+  if (explicitProvider === 'mongodb') {
+    provider = 'mongodb';
+  } else if (explicitProvider === 'postgres' || explicitProvider === 'supabase') {
     provider = 'postgres';
-  } else if (isSupabaseConfigured) {
-    provider = 'supabase';
   } else {
+    provider = isSupabaseConfigured ? 'postgres' : 'mongodb';
+  }
+
+  // An explicit PostgreSQL selection without Supabase credentials is a
+  // configuration error: refuse to silently serve reads from MongoDB.
+  if (provider === 'postgres' && !isSupabaseConfigured) {
+    console.warn(
+      '[Database] DB_PROVIDER requests PostgreSQL but SUPABASE_URL / SUPABASE_SECRET_KEY are missing or placeholders. ' +
+        'Falling back to the preserved MongoDB implementation.'
+    );
     provider = 'mongodb';
   }
 
@@ -105,7 +122,21 @@ export function getDatabaseConfig(): DatabaseConfig {
   };
 }
 
-let cachedHostStatus: { [host: string]: boolean } = {};
+/**
+ * Summarizes which database integrations are wired up without exposing secrets.
+ * Safe to log during startup diagnostics.
+ */
+export function describeDatabaseConfig(): string {
+  const config = getDatabaseConfig();
+  return [
+    `provider=${config.provider}`,
+    `supabase=${config.isSupabaseConfigured ? maskUri(config.supabaseUrl) : 'not configured'}`,
+    `transactions=${config.isPostgresConfigured ? maskUri(config.databaseUrl) : 'pg pool not configured'}`,
+    `mongodbFallback=${config.isMongoConfigured ? 'configured' : 'not configured'}`,
+  ].join(' | ');
+}
+
+const cachedHostStatus: { [host: string]: boolean } = {};
 
 /**
  * Checks if Supabase host is genuinely resolvable and alive before any connection attempt

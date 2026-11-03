@@ -118,3 +118,48 @@ export async function createClinicalRecord(data: Partial<ClinicalRecordData>): P
     id: obj._id?.toString(),
   };
 }
+
+/**
+ * Lists clinical records across patients (used by the admin backup export).
+ */
+export async function listClinicalRecords(limit: number = 5000): Promise<ClinicalRecordData[]> {
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('clinical_records')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      throw new Error(`Database error listing clinical records: ${error.message}`);
+    }
+
+    return (data || []).map((row) => ({
+      id: row.id,
+      patientId: row.patient_id,
+      psychiatricHistory: row.psychiatric_history,
+      medicalHistory: row.medical_history,
+      personalHistory: row.personal_history,
+      familyHistory: row.family_history,
+      socialHistory: row.social_history,
+      mentalStatusExam: row.mental_status_exam,
+      riskAssessment: row.risk_assessment,
+      recordType: row.record_type || 'CLINICAL_RECORD',
+      details: row.details || {},
+      author: row.author || 'System',
+      createdBy: row.created_by || 'System',
+      updatedBy: row.updated_by || 'System',
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  // Fallback: MongoDB
+  const docs = await ClinicalRecord.find().sort({ createdAt: -1 }).limit(limit).lean();
+  return docs.map((d: any) => ({
+    ...d,
+    id: d._id?.toString(),
+  }));
+}
+

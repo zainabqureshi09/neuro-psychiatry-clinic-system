@@ -1,12 +1,57 @@
-import User from "../../models/User";
 import { logger } from "../utils/logger";
+import { countUsers, createUser } from "../../lib/db/repositories/userRepository";
+
+type PermissionMatrix = {
+  canWriteClinicalNotes: boolean;
+  canPrescribe: boolean;
+  canManagePatients: boolean;
+  canManageAppointments: boolean;
+  canManageUsers: boolean;
+  canViewReports: boolean;
+};
+
+const PERMISSIONS: Record<string, PermissionMatrix> = {
+  ADMIN: {
+    canWriteClinicalNotes: true,
+    canPrescribe: true,
+    canManagePatients: true,
+    canManageAppointments: true,
+    canManageUsers: true,
+    canViewReports: true,
+  },
+  DOCTOR: {
+    canWriteClinicalNotes: true,
+    canPrescribe: true,
+    canManagePatients: true,
+    canManageAppointments: true,
+    canManageUsers: false,
+    canViewReports: true,
+  },
+  RECEPTION: {
+    canWriteClinicalNotes: false,
+    canPrescribe: false,
+    canManagePatients: true,
+    canManageAppointments: true,
+    canManageUsers: false,
+    canViewReports: false,
+  },
+  THERAPIST: {
+    canWriteClinicalNotes: true,
+    canPrescribe: false,
+    canManagePatients: true,
+    canManageAppointments: true,
+    canManageUsers: false,
+    canViewReports: false,
+  },
+};
 
 /**
- * Seeds initial staff accounts for all 4 roles if the database contains no users.
+ * Seeds initial staff accounts if the database contains no users.
+ * Passwords are bcrypt-hashed by the user repository (never stored in plaintext).
  */
 export const seedDefaultAdmin = async (): Promise<void> => {
   try {
-    const count = await User.countDocuments();
+    const count = await countUsers();
     if (count > 0) {
       return;
     }
@@ -18,26 +63,16 @@ export const seedDefaultAdmin = async (): Promise<void> => {
       const adminPass = process.env.INITIAL_ADMIN_PASSWORD;
 
       if (adminEmail && adminPass) {
-        const prodAdmin = new User({
+        await createUser({
           userId: "USR-001",
           name: "Clinic Administrator",
           email: adminEmail,
-          passwordHash: adminPass,
+          password: adminPass,
           role: "ADMIN",
           title: "System Administrator",
           department: "Administration",
-          permissions: {
-            canWriteClinicalNotes: true,
-            canPrescribe: true,
-            canManagePatients: true,
-            canManageAppointments: true,
-            canManageUsers: true,
-            canViewReports: true,
-          },
-          isActive: true,
-          lastActive: new Date().toISOString(),
+          permissions: PERMISSIONS.ADMIN,
         });
-        await prodAdmin.save();
         logger.info(`Production initial admin account created for '${adminEmail}'.`);
       } else {
         logger.warn(
@@ -52,100 +87,60 @@ export const seedDefaultAdmin = async (): Promise<void> => {
         userId: "USR-001",
         name: "Clinic Administrator",
         email: process.env.INITIAL_ADMIN_EMAIL || "admin@clinic.com",
-        passwordHash: process.env.INITIAL_ADMIN_PASSWORD || "Admin@123456",
+        password: process.env.INITIAL_ADMIN_PASSWORD || "Admin@123456",
         role: "ADMIN" as const,
         title: "System Administrator",
         department: "Administration",
-        permissions: {
-          canWriteClinicalNotes: true,
-          canPrescribe: true,
-          canManagePatients: true,
-          canManageAppointments: true,
-          canManageUsers: true,
-          canViewReports: true,
-        },
-        isActive: true,
       },
       {
         userId: "USR-002",
         name: "Marcus Sterling",
         email: "m.sterling@vancepsychiatry.com",
-        passwordHash: "Vance2026!",
+        password: "Vance2026!",
         role: "ADMIN" as const,
         title: "Practice Director",
         department: "Administration",
-        permissions: {
-          canWriteClinicalNotes: true,
-          canPrescribe: true,
-          canManagePatients: true,
-          canManageAppointments: true,
-          canManageUsers: true,
-          canViewReports: true,
-        },
-        isActive: true,
       },
       {
         userId: "USR-003",
         name: "DR SHAHAB MUHAMMAD",
         email: "dr.vance@vancepsychiatry.com",
-        passwordHash: "Vance2026!",
+        password: "Vance2026!",
         role: "DOCTOR" as const,
         title: "HOD & Consultant Psychiatrist",
         department: "Psychiatry",
-        permissions: {
-          canWriteClinicalNotes: true,
-          canPrescribe: true,
-          canManagePatients: true,
-          canManageAppointments: true,
-          canManageUsers: false,
-          canViewReports: true,
-        },
-        isActive: true,
       },
       {
         userId: "USR-004",
         name: "Sarah Jenkins",
         email: "s.jenkins@vancepsychiatry.com",
-        passwordHash: "Vance2026!",
+        password: "Vance2026!",
         role: "RECEPTION" as const,
         title: "Clinical Coordinator",
         department: "Reception",
-        permissions: {
-          canWriteClinicalNotes: false,
-          canPrescribe: false,
-          canManagePatients: true,
-          canManageAppointments: true,
-          canManageUsers: false,
-          canViewReports: false,
-        },
-        isActive: true,
       },
       {
         userId: "USR-005",
         name: "Dr. Emily Watson, PsyD",
         email: "e.watson@vancepsychiatry.com",
-        passwordHash: "Vance2026!",
+        password: "Vance2026!",
         role: "THERAPIST" as const,
         title: "Senior Clinical Psychologist",
         department: "Psychotherapy",
-        permissions: {
-          canWriteClinicalNotes: true,
-          canPrescribe: false,
-          canManagePatients: true,
-          canManageAppointments: true,
-          canManageUsers: false,
-          canViewReports: false,
-        },
-        isActive: true,
       },
     ];
 
     for (const staff of defaultStaff) {
-      const u = new User({
-        ...staff,
-        lastActive: new Date().toISOString(),
+      await createUser({
+        userId: staff.userId,
+        name: staff.name,
+        email: staff.email,
+        password: staff.password,
+        role: staff.role,
+        title: staff.title,
+        department: staff.department,
+        permissions: PERMISSIONS[staff.role],
       });
-      await u.save();
     }
 
     logger.info("Default staff accounts bootstrapped successfully for ADMIN, DOCTOR, RECEPTION, and THERAPIST.");
@@ -153,3 +148,4 @@ export const seedDefaultAdmin = async (): Promise<void> => {
     logger.error("Error seeding default staff accounts:", error.message || error);
   }
 };
+

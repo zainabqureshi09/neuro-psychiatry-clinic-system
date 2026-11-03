@@ -22,6 +22,27 @@ export interface FollowUpRecord {
   updatedAt?: string | Date;
 }
 
+/**
+ * Derives the clinical follow-up status from the due date, preserving terminal
+ * states. Shared by the Next.js routes and the Express controllers so both APIs
+ * report identical statuses.
+ */
+export function deriveFollowUpStatus(
+  followUpDate: string,
+  currentStatus?: string,
+  todayStr: string = new Date().toISOString().split('T')[0]
+): string {
+  if (currentStatus && /^completed$/i.test(currentStatus)) {
+    return currentStatus;
+  }
+  if (!followUpDate || followUpDate === 'N/A') {
+    return currentStatus || 'Upcoming';
+  }
+  if (followUpDate === todayStr) return 'Due';
+  if (followUpDate < todayStr) return 'Overdue';
+  return 'Upcoming';
+}
+
 export async function generateFollowUpId(): Promise<string> {
   const supabase = getSupabaseClient();
   if (supabase) {

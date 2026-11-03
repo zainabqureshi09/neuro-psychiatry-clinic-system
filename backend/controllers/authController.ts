@@ -1,9 +1,33 @@
 import { Request, Response, NextFunction } from "express";
-import User from "../../models/User";
-import { generateToken } from "../utils/authUtils";
+import { generateToken, comparePassword } from "../utils/authUtils";
 import { recordAuditEvent } from "../utils/auditLogger";
+import {
+  findUserByEmail,
+  updateUser,
+  UserRecord,
+} from "../../lib/db/repositories/userRepository";
+import { AuthenticatedUser } from "../middleware/authMiddleware";
 
 export { createUser } from "./userController";
+
+/** Public (hash-free) representation of a staff account. */
+export const toPublicUser = (user: Omit<UserRecord, "passwordHash"> | UserRecord) => ({
+  id: user.userId,
+  userId: user.userId,
+  name: user.name,
+  email: user.email,
+  role: user.role,
+  phone: user.phone || "",
+  avatar: user.avatar || "",
+  title: user.title || "",
+  department: user.department || "",
+  permissions: user.permissions,
+  isActive: user.isActive,
+  status: user.isActive ? "ACTIVE" : "INACTIVE",
+  lastActive: user.lastActive || "Never",
+  createdAt: user.createdAt,
+  updatedAt: user.updatedAt,
+});
 
 /**
  * POST /api/auth/login
@@ -13,7 +37,7 @@ export const login = async (req: Request, res: Response, next: NextFunction): Pr
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    const user = await findUserByEmail(String(email || ""));
 
     if (!user) {
       await recordAuditEvent({
@@ -47,7 +71,7 @@ export const login = async (req: Request, res: Response, next: NextFunction): Pr
       return;
     }
 
-    const isMatch = await user.comparePassword(password);
+    const isMatch = await comparePassword(String(password || ""), user.passwordHash);
     if (!isMatch) {
       await recordAuditEvent({
         userId: user.userId,
@@ -64,12 +88,15 @@ export const login = async (req: Request, res: Response, next: NextFunction): Pr
       return;
     }
 
-    // Update lastActive timestamp
-    user.lastActive = new Date().toISOString();
-    await user.save();
+    // Update lastActive timestamp (non-blocking for the session itself)
+    try {
+      await updateUser(user.userId, { lastActive: new Date().toISOString() });
+    } catch (updateError: any) {
+      console.error("[Auth] Unable to update lastActive:", updateError?.message || updateError);
+    }
 
     const token = await generateToken({
-      id: user._id.toString(),
+      id: user.userId,
       userId: user.userId,
       email: user.email,
       name: user.name,
@@ -95,11 +122,14 @@ export const login = async (req: Request, res: Response, next: NextFunction): Pr
       description: `User ${user.name} (${user.userId}) logged in successfully.`,
     });
 
+    const publicUser = toPublicUser(user);
+
     res.status(200).json({
       success: true,
       message: "Login successful.",
       token,
-      user: user.toJSON(),
+      user: publicUser,
+      data: publicUser,
     });
   } catch (error) {
     next(error);
@@ -134,10 +164,11 @@ export const logout = (req: Request, res: Response): void => {
  * Returns currently authenticated user profile.
  */
 export const getCurrentUser = (req: Request, res: Response): void => {
-  const userJson = req.user ? req.user.toJSON() : null;
+  const userJson = req.user ? toPublicUser(req.user as AuthenticatedUser) : null;
   res.status(200).json({
     success: true,
     data: userJson,
     user: userJson,
   });
 };
+

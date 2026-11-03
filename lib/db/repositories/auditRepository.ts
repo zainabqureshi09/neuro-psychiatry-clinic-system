@@ -110,23 +110,38 @@ export async function recordAuditEvent(event: {
 
 export async function listAuditLogs(filter: {
   userId?: string;
+  userRole?: string;
   module?: string;
   action?: string;
   patientRef?: string;
+  search?: string;
+  startDate?: string;
+  endDate?: string;
   page?: number;
   limit?: number;
 } = {}): Promise<{ data: AuditLogRecord[]; total: number; page: number; limit: number }> {
   const page = filter.page || 1;
-  const limit = Math.min(filter.limit || 50, 100);
+  const limit = Math.min(filter.limit || 50, 200);
 
   const supabase = getSupabaseClient();
   if (supabase) {
     let query = supabase.from('audit_logs').select('*', { count: 'exact' });
 
     if (filter.userId) query = query.eq('user_id', filter.userId);
+    if (filter.userRole) query = query.eq('user_role', filter.userRole);
     if (filter.module) query = query.eq('module', filter.module);
     if (filter.action) query = query.eq('action', filter.action);
     if (filter.patientRef) query = query.eq('patient_ref', filter.patientRef);
+    if (filter.search) {
+      const term = filter.search;
+      query = query.or(
+        `log_id.ilike.%${term}%,description.ilike.%${term}%,user_name.ilike.%${term}%,user_id.ilike.%${term}%,patient_ref.ilike.%${term}%`
+      );
+    }
+    if (filter.startDate) query = query.gte('created_at', filter.startDate);
+    if (filter.endDate) {
+      query = query.lte('created_at', `${filter.endDate}T23:59:59.999Z`);
+    }
 
     const from = (page - 1) * limit;
     const to = from + limit - 1;
@@ -149,9 +164,29 @@ export async function listAuditLogs(filter: {
   // Fallback: MongoDB
   const mongoFilter: any = {};
   if (filter.userId) mongoFilter.userId = filter.userId;
+  if (filter.userRole) mongoFilter.userRole = filter.userRole;
   if (filter.module) mongoFilter.module = filter.module;
   if (filter.action) mongoFilter.action = filter.action;
   if (filter.patientRef) mongoFilter.patientRef = filter.patientRef;
+  if (filter.search) {
+    const searchRegex = new RegExp(filter.search, 'i');
+    mongoFilter.$or = [
+      { logId: searchRegex },
+      { description: searchRegex },
+      { userName: searchRegex },
+      { userId: searchRegex },
+      { patientRef: searchRegex },
+    ];
+  }
+  if (filter.startDate || filter.endDate) {
+    mongoFilter.createdAt = {};
+    if (filter.startDate) mongoFilter.createdAt.$gte = new Date(filter.startDate);
+    if (filter.endDate) {
+      const toDate = new Date(filter.endDate);
+      toDate.setHours(23, 59, 59, 999);
+      mongoFilter.createdAt.$lte = toDate;
+    }
+  }
 
   const total = await AuditLog.countDocuments(mongoFilter);
   const skip = (page - 1) * limit;

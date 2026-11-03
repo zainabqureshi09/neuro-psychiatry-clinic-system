@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
-import AuditLog from '../../models/AuditLog';
 import { recordAuditEvent, sanitizeAuditData } from '../utils/auditLogger';
+import { listAuditLogs, recordAuditEvent as persistAuditEvent } from '../../lib/db/repositories/auditRepository';
 
 /**
  * GET /api/audit-logs
@@ -18,65 +18,28 @@ export const getAuditLogs = async (req: Request, res: Response, next: NextFuncti
     const page = Math.max(1, parseInt((req.query.page || '1').toString(), 10));
     const limit = Math.max(1, Math.min(100, parseInt((req.query.limit || '50').toString(), 10)));
 
-    const filter: Record<string, any> = {};
-
-    if (search) {
-      const searchRegex = new RegExp(search, 'i');
-      filter.$or = [
-        { logId: searchRegex },
-        { description: searchRegex },
-        { userName: searchRegex },
-        { userId: searchRegex },
-        { patientRef: searchRegex },
-      ];
-    }
-
-    if (action && action !== 'All') {
-      filter.action = action;
-    }
-
-    if (moduleName && moduleName !== 'All') {
-      filter.module = moduleName;
-    }
-
-    if (user && user !== 'All') {
-      filter.$or = [
-        { userId: user },
-        { userName: new RegExp(user, 'i') },
-      ];
-    }
-
-    if (startDate || endDate) {
-      filter.createdAt = {};
-      if (startDate) {
-        filter.createdAt.$gte = new Date(startDate);
-      }
-      if (endDate) {
-        const toDate = new Date(endDate);
-        toDate.setHours(23, 59, 59, 999);
-        filter.createdAt.$lte = toDate;
-      }
-    }
-
-    const total = await AuditLog.countDocuments(filter);
-    const skip = (page - 1) * limit;
-
-    const logs = await AuditLog.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
+    const result = await listAuditLogs({
+      search: search || undefined,
+      action: action && action !== 'All' ? action : undefined,
+      module: moduleName && moduleName !== 'All' ? moduleName : undefined,
+      userId: user && user !== 'All' ? user : undefined,
+      startDate: startDate || undefined,
+      endDate: endDate || undefined,
+      page,
+      limit,
+    });
 
     res.status(200).json({
       success: true,
-      count: logs.length,
-      total,
+      count: result.data.length,
+      total: result.total,
       pagination: {
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit) || 1,
-        total,
+        page: result.page,
+        limit: result.limit,
+        totalPages: Math.ceil(result.total / result.limit) || 1,
+        total: result.total,
       },
-      data: logs,
+      data: result.data,
     });
   } catch (error) {
     next(error);
@@ -85,7 +48,7 @@ export const getAuditLogs = async (req: Request, res: Response, next: NextFuncti
 
 /**
  * POST /api/audit-logs
- * Authenticated endpoint to record an audit log event in MongoDB.
+ * Authenticated endpoint to record an audit log event.
  */
 export const createAuditLog = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
@@ -96,11 +59,8 @@ export const createAuditLog = async (req: Request, res: Response, next: NextFunc
     const moduleName = body.module || 'SYSTEM';
     const description = body.description || `${action} on ${moduleName}`;
 
-    const metadata = sanitizeAuditData(body.metadata || {});
-
-    const logEntry = await recordAuditEvent({
-      preferredId: body.id || body.logId,
-      userId: body.userId || user?.userId || user?.id || 'SYSTEM',
+    const logEntry = await persistAuditEvent({
+      userId: body.userId || user?.userId || 'SYSTEM',
       userName: body.userName || user?.name || 'System Process',
       userRole: body.userRole || user?.role || 'SYSTEM',
       action,
@@ -109,7 +69,7 @@ export const createAuditLog = async (req: Request, res: Response, next: NextFunc
       resourceId: body.resourceId || '',
       patientRef: body.patientRef || '',
       description,
-      metadata,
+      metadata: sanitizeAuditData(body.metadata || {}),
     });
 
     if (!logEntry) {
@@ -119,10 +79,9 @@ export const createAuditLog = async (req: Request, res: Response, next: NextFunc
 
     res.status(201).json({
       success: true,
-      data: { ...logEntry.toObject(), id: logEntry.logId },
+      data: { ...logEntry, id: logEntry.logId },
     });
   } catch (error) {
     next(error);
   }
 };
-

@@ -1,17 +1,24 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import Consultation from '@/models/Consultation';
-import Patient from '@/models/Patient';
+﻿import { NextResponse } from 'next/server';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import {
+  getConsultationByIdForPatient,
+  updateConsultation,
+} from '@/lib/db/repositories/consultationRepository';
+import { getPatientById } from '@/lib/db/repositories/patientRepository';
+import { auditFromSession } from '@/lib/audit';
+
+const RESTRICTED = '[Restricted: Clinical Note Access Limited for Reception]';
 
 function sanitizeForReception(c: any) {
   return {
     ...c,
-    presentingComplaint: '[Restricted: Clinical Note Access Limited for Reception]',
-    clinicalObservations: '[Restricted: Clinical Note Access Limited for Reception]',
-    treatmentPlan: '[Restricted: Clinical Note Access Limited for Reception]',
-    notes: '[Restricted: Clinical Note Access Limited for Reception]',
-    followUpNotes: '[Restricted: Clinical Note Access Limited for Reception]',
+    presentingComplaint: RESTRICTED,
+    clinicalObservations: RESTRICTED,
+    treatmentPlan: RESTRICTED,
+    notes: RESTRICTED,
+    followUpNotes: RESTRICTED,
     mentalStatusExam: {
       appearance: '[Restricted]',
       behavior: '[Restricted]',
@@ -32,16 +39,13 @@ export async function GET(
   { params }: { params: Promise<{ patientId: string; consultationId: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'RECEPTION', 'ADMIN', 'THERAPIST']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'RECEPTION', 'ADMIN', 'THERAPIST'], req);
     if (!auth.authorized) return auth.response!;
 
     const { patientId, consultationId } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
 
-    const isValidPatientObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId }, { _id: isValidPatientObjectId ? patientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       return NextResponse.json(
@@ -50,11 +54,7 @@ export async function GET(
       );
     }
 
-    const isValidConsultObjectId = /^[0-9a-fA-F]{24}$/.test(consultationId);
-    const consultation = await Consultation.findOne({
-      $or: [{ consultationId }, { _id: isValidConsultObjectId ? consultationId : null }],
-      patientId: patient.patientId,
-    }).lean();
+    const consultation = await getConsultationByIdForPatient(consultationId, patient.patientId);
 
     if (!consultation) {
       return NextResponse.json(
@@ -63,23 +63,24 @@ export async function GET(
       );
     }
 
-    const isReception = auth.session?.role === 'RECEPTION' || auth.session?.role === 'RECEPTIONIST';
     const formatted = {
       ...consultation,
       id: consultation.consultationId,
       date: consultation.consultationDate,
     };
-    const data = isReception ? sanitizeForReception(formatted) : formatted;
+    const isReception = auth.session?.role === 'RECEPTION' || auth.session?.role === 'RECEPTIONIST';
 
     return NextResponse.json({
       success: true,
-      data,
+      data: isReception ? sanitizeForReception(formatted) : formatted,
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to fetch consultation details.' },
-      { status: 500 }
+    console.error('Error fetching patient consultation:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to fetch consultation details.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
@@ -89,17 +90,14 @@ export async function PUT(
   { params }: { params: Promise<{ patientId: string; consultationId: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { patientId, consultationId } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
-    const isValidPatientObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId }, { _id: isValidPatientObjectId ? patientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       return NextResponse.json(
@@ -108,11 +106,22 @@ export async function PUT(
       );
     }
 
-    const isValidConsultObjectId = /^[0-9a-fA-F]{24}$/.test(consultationId);
-    const consultation = await Consultation.findOne({
-      $or: [{ consultationId }, { _id: isValidConsultObjectId ? consultationId : null }],
-      patientId: patient.patientId,
-    });
+    const existing = await getConsultationByIdForPatient(consultationId, patient.patientId);
+
+    if (!existing) {
+      return NextResponse.json(
+        { success: false, error: `Consultation record not found for ID: ${consultationId}` },
+        { status: 404 }
+      );
+    }
+
+    // Identifiers are immutable.
+    delete body.id;
+    delete body._id;
+    delete body.consultationId;
+    delete body.patientId;
+
+    const consultation = await updateConsultation(existing.consultationId, body);
 
     if (!consultation) {
       return NextResponse.json(
@@ -121,22 +130,30 @@ export async function PUT(
       );
     }
 
-    Object.assign(consultation, body);
-    await consultation.save();
+    await auditFromSession(auth.session, {
+      action: 'UPDATE',
+      module: 'CONSULTATIONS',
+      resourceType: 'CONSULTATION',
+      resourceId: consultation.consultationId,
+      patientRef: patient.patientId,
+      description: `Updated consultation ${consultation.consultationId} for ${patient.fullName}`,
+    });
 
     return NextResponse.json({
       success: true,
       data: {
-        ...consultation.toObject(),
+        ...consultation,
         id: consultation.consultationId,
         date: consultation.consultationDate,
       },
       message: 'Consultation record updated successfully.',
     });
   } catch (error: any) {
-    return NextResponse.json(
-      { success: false, error: 'Failed to update consultation record.' },
-      { status: 500 }
+    console.error('Error updating consultation:', error);
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Failed to update consultation record.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

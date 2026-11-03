@@ -1,5 +1,6 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { getDatabaseConfig, maskSecret } from './config';
+import { getDatabaseConfig, maskUri } from './config';
+import { DatabaseUnavailableError } from './errors';
 
 /**
  * Server-Side Supabase Client Management (Option A)
@@ -8,6 +9,7 @@ import { getDatabaseConfig, maskSecret } from './config';
  */
 
 let supabaseClient: SupabaseClient | null = null;
+let clientInjected = false;
 
 export function getSupabaseClient(): SupabaseClient | null {
   if (supabaseClient) return supabaseClient;
@@ -33,9 +35,23 @@ export function getSupabaseClient(): SupabaseClient | null {
 
     return supabaseClient;
   } catch (err: any) {
-    console.error(`[Supabase] Failed to initialize client for ${config.supabaseUrl}:`, err.message);
+    console.error(`[Supabase] Failed to initialize client for ${maskUri(config.supabaseUrl)}:`, err.message);
     return null;
   }
+}
+
+/**
+ * Requires an initialized client or fails with a typed 503 error.
+ * Used by code paths that cannot fall back to the legacy MongoDB layer.
+ */
+export function requireSupabaseClient(): SupabaseClient {
+  const client = getSupabaseClient();
+  if (!client) {
+    throw new DatabaseUnavailableError(
+      'Supabase client is not configured. Set SUPABASE_URL and SUPABASE_SECRET_KEY, or use the MongoDB fallback.'
+    );
+  }
+  return client;
 }
 
 /**
@@ -43,4 +59,22 @@ export function getSupabaseClient(): SupabaseClient | null {
  */
 export function setSupabaseClient(client: SupabaseClient | null): void {
   supabaseClient = client;
+  clientInjected = client !== null;
 }
+
+/**
+ * True when a client was injected by tests, which bypasses DNS reachability
+ * probes (no network access is required or expected for unit-level validation).
+ */
+export function hasSupabaseClientOverride(): boolean {
+  return clientInjected;
+}
+
+/**
+ * Releases the memoized client (used by tests and graceful shutdown).
+ */
+export function resetSupabaseClient(): void {
+  supabaseClient = null;
+  clientInjected = false;
+}
+

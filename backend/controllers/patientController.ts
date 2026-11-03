@@ -1,7 +1,17 @@
 import { Request, Response, NextFunction } from "express";
-import Patient from "../../models/Patient";
-import ClinicalRecord from "../../models/ClinicalRecord";
 import { recordAuditEvent } from "../utils/auditLogger";
+import {
+  listPatients,
+  getPatientById as getPatientRecord,
+  createPatient as createPatientRecord,
+  updatePatient as updatePatientRecord,
+  softDeletePatient,
+  findPatientConflict,
+} from "../../lib/db/repositories/patientRepository";
+import {
+  getClinicalRecordsByPatientId,
+  createClinicalRecord as createClinicalRecordEntry,
+} from "../../lib/db/repositories/clinicalRecordRepository";
 
 /**
  * Helper to calculate age from date of birth (YYYY-MM-DD)
@@ -19,22 +29,6 @@ const calculateAge = (dobString: string): number => {
 };
 
 /**
- * Safe sequential Patient ID generator (PX-XXXX format)
- */
-const generatePatientId = async (): Promise<string> => {
-  const count = await Patient.countDocuments();
-  let candidateNum = 9401 + count;
-  let candidateId = `PX-${candidateNum}`;
-
-  while (await Patient.exists({ patientId: candidateId })) {
-    candidateNum++;
-    candidateId = `PX-${candidateNum}`;
-  }
-
-  return candidateId;
-};
-
-/**
  * GET /api/patients
  * Paginated list of active patients with search & filter support
  */
@@ -46,45 +40,26 @@ export const getPatients = async (req: Request, res: Response, next: NextFunctio
     const page = Math.max(1, parseInt((req.query.page || "1").toString(), 10));
     const limit = Math.max(1, Math.min(100, parseInt((req.query.limit || "50").toString(), 10)));
 
-    const filter: Record<string, any> = { isActive: { $ne: false } };
-
-    if (search) {
-      const searchRegex = new RegExp(search, "i");
-      filter.$or = [
-        { patientId: searchRegex },
-        { fullName: searchRegex },
-        { phone: searchRegex },
-        { email: searchRegex },
-      ];
-    }
-
-    if (gender && gender !== "All") {
-      filter.gender = gender;
-    }
-
-    if (status && status !== "All") {
-      filter.status = status;
-    }
-
-    const total = await Patient.countDocuments(filter);
-    const skip = (page - 1) * limit;
-
-    const patients = await Patient.find(filter)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
+    const result = await listPatients({
+      search,
+      gender,
+      status,
+      page,
+      limit,
+      includeInactive: false,
+    });
 
     res.status(200).json({
       success: true,
-      count: patients.length,
-      total,
+      count: result.data.length,
+      total: result.total,
       pagination: {
-        page,
-        limit,
-        totalPages: Math.ceil(total / limit) || 1,
-        total,
+        page: result.page,
+        limit: result.limit,
+        totalPages: Math.ceil(result.total / result.limit) || 1,
+        total: result.total,
       },
-      data: patients,
+      data: result.data,
     });
   } catch (error) {
     next(error);
@@ -98,12 +73,8 @@ export const getPatients = async (req: Request, res: Response, next: NextFunctio
 export const getPatientById = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const patient = await Patient.findOne({
-      $or: [{ patientId: id }, { _id: isValidObjectId ? id : null }],
-      isActive: { $ne: false },
-    });
+    const patient = await getPatientRecord(id, { includeInactive: false });
 
     if (!patient) {
       res.status(404).json({
@@ -141,69 +112,61 @@ export const createPatient = async (req: Request, res: Response, next: NextFunct
     } = req.body;
 
     // Check duplicate phone or CNIC
-    if (phone || req.body.cnic) {
-      const dupQuery: any[] = [];
-      if (phone) dupQuery.push({ phone: phone.trim() });
-      if (req.body.cnic) dupQuery.push({ cnic: req.body.cnic.trim() });
-      const existingPatient = await Patient.findOne({ $or: dupQuery });
-      if (existingPatient) {
-        res.status(400).json({
-          success: false,
-          error: "A patient chart with this phone number or CNIC already exists.",
-        });
-        return;
-      }
+    const existingPatient = await findPatientConflict(phone, req.body.cnic);
+    if (existingPatient) {
+      res.status(400).json({
+        success: false,
+        error: "A patient chart with this phone number or CNIC already exists.",
+      });
+      return;
     }
 
-    const patientId = await generatePatientId();
-    const age = req.body.age !== undefined ? req.body.age : calculateAge(dateOfBirth);
+    const age = req.body.age !== undefined ? Number(req.body.age) : calculateAge(dateOfBirth);
     const registeredDate = new Date().toISOString().split("T")[0];
     const createdBy = req.user?.userId || req.user?.email || "SYSTEM";
 
-    const newPatient = new Patient({
-      patientId,
-      fullName: fullName.trim(),
-      dateOfBirth,
-      age,
-      gender,
-      phone: phone.trim(),
-      email: email ? email.trim() : "",
-      address: address ? address.trim() : "",
-      emergencyContact: emergencyContact || { name: "", relationship: "", phone: "" },
-      clinicalIntake: clinicalIntake || {
-        presentingComplaint: "Initial intake.",
-        psychiatricHistory: "No prior documented admissions.",
-        currentMedications: "None.",
-        allergies: "NKDA.",
-        familyHistory: "Non-contributory.",
-        riskAssessment: "Low",
+    const newPatient = await createPatientRecord(
+      {
+        fullName: String(fullName).trim(),
+        dateOfBirth,
+        age,
+        gender,
+        phone: String(phone).trim(),
+        email: email ? String(email).trim() : "",
+        address: address ? String(address).trim() : "",
+        emergencyContact: emergencyContact || { name: "", relationship: "", phone: "" },
+        clinicalIntake: clinicalIntake || {
+          presentingComplaint: "Initial intake.",
+          psychiatricHistory: "No prior documented admissions.",
+          currentMedications: "None.",
+          allergies: "NKDA.",
+          familyHistory: "Non-contributory.",
+          riskAssessment: "Low",
+        },
+        status: status || "Active",
+        registeredDate,
+        lastVisitDate: "Pending Intake",
+        nextFollowUpDate: "Not Scheduled",
+        isActive: true,
+        createdBy,
       },
-      status: status || "Active",
-      registeredDate,
-      lastVisitDate: "Pending Intake",
-      nextFollowUpDate: "Not Scheduled",
-      isActive: true,
-      createdBy,
+      createdBy
+    );
+
+    await recordAuditEvent({
+      userId: createdBy,
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "CREATE",
+      module: "PATIENTS",
+      resourceId: newPatient.patientId,
+      patientRef: newPatient.patientId,
+      description: `Registered new patient ${newPatient.fullName} (${newPatient.patientId})`,
     });
-
-    await newPatient.save();
-
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: "CREATE",
-        module: "PATIENTS",
-        resourceId: patientId,
-        patientRef: patientId,
-        description: `Registered new patient ${fullName} (${patientId})`,
-      });
-    }
 
     res.status(201).json({
       success: true,
-      message: `Patient ${fullName} registered successfully with ID ${patientId}.`,
+      message: `Patient ${newPatient.fullName} registered successfully with ID ${newPatient.patientId}.`,
       data: newPatient,
     });
   } catch (error) {
@@ -218,12 +181,8 @@ export const createPatient = async (req: Request, res: Response, next: NextFunct
 export const updatePatient = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const patient = await Patient.findOne({
-      $or: [{ patientId: id }, { _id: isValidObjectId ? id : null }],
-      isActive: { $ne: false },
-    });
+    const patient = await getPatientRecord(id, { includeInactive: false });
 
     if (!patient) {
       res.status(404).json({
@@ -247,42 +206,46 @@ export const updatePatient = async (req: Request, res: Response, next: NextFunct
       nextFollowUpDate,
     } = req.body;
 
-    if (fullName) patient.fullName = fullName.trim();
+    const updates: Record<string, any> = {
+      updatedBy: req.user?.userId || req.user?.email || "SYSTEM",
+    };
+
+    if (fullName) updates.fullName = String(fullName).trim();
     if (dateOfBirth) {
-      patient.dateOfBirth = dateOfBirth;
-      patient.age = calculateAge(dateOfBirth);
+      updates.dateOfBirth = dateOfBirth;
+      updates.age = calculateAge(dateOfBirth);
     }
-    if (gender) patient.gender = gender;
-    if (phone) patient.phone = phone.trim();
-    if (email !== undefined) patient.email = email.trim();
-    if (address !== undefined) patient.address = address.trim();
-    if (status) patient.status = status;
-    if (emergencyContact) patient.emergencyContact = { ...patient.emergencyContact, ...emergencyContact };
-    if (clinicalIntake) patient.clinicalIntake = { ...patient.clinicalIntake, ...clinicalIntake };
-    if (lastVisitDate) patient.lastVisitDate = lastVisitDate;
-    if (nextFollowUpDate) patient.nextFollowUpDate = nextFollowUpDate;
-
-    patient.updatedBy = req.user?.userId || req.user?.email || "SYSTEM";
-
-    await patient.save();
-
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: "UPDATE",
-        module: "PATIENTS",
-        resourceId: patient.patientId,
-        patientRef: patient.patientId,
-        description: `Updated chart details for patient ${patient.fullName} (${patient.patientId})`,
-      });
+    if (gender) updates.gender = gender;
+    if (phone) updates.phone = String(phone).trim();
+    if (email !== undefined) updates.email = String(email).trim();
+    if (address !== undefined) updates.address = String(address).trim();
+    if (status) updates.status = status;
+    if (emergencyContact) {
+      updates.emergencyContact = { ...(patient.emergencyContact || {}), ...emergencyContact };
     }
+    if (clinicalIntake) {
+      updates.clinicalIntake = { ...(patient.clinicalIntake || {}), ...clinicalIntake };
+    }
+    if (lastVisitDate) updates.lastVisitDate = lastVisitDate;
+    if (nextFollowUpDate) updates.nextFollowUpDate = nextFollowUpDate;
+
+    const updated = (await updatePatientRecord(patient.patientId, updates)) || { ...patient, ...updates };
+
+    await recordAuditEvent({
+      userId: req.user?.userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "UPDATE",
+      module: "PATIENTS",
+      resourceId: updated.patientId,
+      patientRef: updated.patientId,
+      description: `Updated chart details for patient ${updated.fullName} (${updated.patientId})`,
+    });
 
     res.status(200).json({
       success: true,
-      message: `Patient record ${patient.patientId} updated successfully.`,
-      data: patient,
+      message: `Patient record ${updated.patientId} updated successfully.`,
+      data: updated,
     });
   } catch (error) {
     next(error);
@@ -291,17 +254,13 @@ export const updatePatient = async (req: Request, res: Response, next: NextFunct
 
 /**
  * DELETE /api/patients/:id
- * Soft delete / deactivate patient record
+ * Soft delete / deactivate patient record (clinical & billing history preserved)
  */
 export const deletePatient = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const patient = await Patient.findOne({
-      $or: [{ patientId: id }, { _id: isValidObjectId ? id : null }],
-      isActive: { $ne: false },
-    });
+    const patient = await getPatientRecord(id, { includeInactive: false });
 
     if (!patient) {
       res.status(404).json({
@@ -311,24 +270,29 @@ export const deletePatient = async (req: Request, res: Response, next: NextFunct
       return;
     }
 
-    patient.isActive = false;
-    patient.status = "Discharged";
-    patient.updatedBy = req.user?.userId || req.user?.email || "SYSTEM";
+    const deactivated = await softDeletePatient(
+      patient.patientId,
+      req.user?.userId || req.user?.email || "SYSTEM"
+    );
 
-    await patient.save();
-
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: "DELETE",
-        module: "PATIENTS",
-        resourceId: patient.patientId,
-        patientRef: patient.patientId,
-        description: `Deactivated patient record for ${patient.fullName} (${patient.patientId})`,
+    if (!deactivated) {
+      res.status(404).json({
+        success: false,
+        error: `Patient record not found for ID: ${id}`,
       });
+      return;
     }
+
+    await recordAuditEvent({
+      userId: req.user?.userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "DELETE",
+      module: "PATIENTS",
+      resourceId: patient.patientId,
+      patientRef: patient.patientId,
+      description: `Deactivated patient record for ${patient.fullName} (${patient.patientId}); clinical and billing history preserved`,
+    });
 
     res.status(200).json({
       success: true,
@@ -347,11 +311,12 @@ export const getClinicalRecords = async (req: Request, res: Response, next: Next
     const rawPatientId = req.params.patientId || (req.query.patientId as string);
     const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : (rawPatientId as string);
 
-    const records = await ClinicalRecord.find({ patientId }).sort({ createdAt: -1 });
+    const records = await getClinicalRecordsByPatientId(patientId);
+
     res.status(200).json({
       success: true,
       count: records.length,
-      data: records.map(r => r.toJSON ? r.toJSON() : r),
+      data: records,
     });
   } catch (error) {
     next(error);
@@ -367,20 +332,30 @@ export const createClinicalRecord = async (req: Request, res: Response, next: Ne
     const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : (rawPatientId as string);
 
     const { recordType, details, author } = req.body;
-    const newRecord = new ClinicalRecord({
+
+    const newRecord = await createClinicalRecordEntry({
       patientId,
-      recordType: recordType || 'CLINICAL_RECORD',
+      recordType: recordType || "CLINICAL_RECORD",
       details: details || req.body,
-      author: author || req.user?.name || 'System',
-      createdBy: req.user?.userId || 'SYSTEM',
+      author: author || req.user?.name || "System",
+      createdBy: req.user?.userId || "SYSTEM",
     });
 
-    await newRecord.save();
+    await recordAuditEvent({
+      userId: req.user?.userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "CREATE",
+      module: "CLINICAL_RECORDS",
+      resourceId: newRecord.id || patientId,
+      patientRef: patientId,
+      description: `Documented clinical record (${newRecord.recordType || "CLINICAL_RECORD"}) for patient ${patientId}`,
+    });
 
     res.status(201).json({
       success: true,
-      message: 'Clinical record documented successfully.',
-      data: newRecord.toJSON ? newRecord.toJSON() : newRecord,
+      message: "Clinical record documented successfully.",
+      data: newRecord,
     });
   } catch (error) {
     next(error);

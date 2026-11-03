@@ -1,31 +1,20 @@
 import { Request, Response, NextFunction } from "express";
-import Consultation, { IConsultation } from "../../models/Consultation";
-import Patient from "../../models/Patient";
 import { recordAuditEvent } from "../utils/auditLogger";
-
-/**
- * Helper to generate sequential Consultation ID (CNS-XXXX)
- */
-const generateConsultationId = async (): Promise<string> => {
-  const count = await Consultation.countDocuments();
-  let candidateNum = 5001 + count;
-  let candidateId = `CNS-${candidateNum}`;
-
-  while (await Consultation.exists({ consultationId: candidateId })) {
-    candidateNum++;
-    candidateId = `CNS-${candidateNum}`;
-  }
-
-  return candidateId;
-};
+import {
+  listConsultations,
+  getConsultationById as getConsultationRecord,
+  updateConsultation as updateConsultationRecord,
+} from "../../lib/db/repositories/consultationRepository";
+import { createConsultationCascade } from "../../lib/db/repositories/consultationCascade";
+import { getPatientById } from "../../lib/db/repositories/patientRepository";
+import { getClinicSettings } from "../../lib/db/repositories/settingsRepository";
 
 /**
  * Helper to sanitize sensitive clinical note fields for restricted roles (e.g. RECEPTION)
  */
 const sanitizeForReception = (consultation: any) => {
-  const obj = typeof consultation.toObject === "function" ? consultation.toObject() : { ...consultation };
   return {
-    ...obj,
+    ...consultation,
     presentingComplaint: "[Restricted: Clinical Note Access Limited for Reception]",
     clinicalObservations: "[Restricted: Clinical Note Access Limited for Reception]",
     treatmentPlan: "[Restricted: Clinical Note Access Limited for Reception]",
@@ -45,6 +34,12 @@ const sanitizeForReception = (consultation: any) => {
   };
 };
 
+const formatConsultation = (consultation: any) => ({
+  ...consultation,
+  id: consultation.consultationId,
+  date: consultation.consultationDate,
+});
+
 /**
  * GET /api/patients/:patientId/consultations (and GET /api/consultations)
  * Retrieve chronological list of consultations for a patient
@@ -57,14 +52,11 @@ export const getPatientConsultations = async (
   try {
     const rawPatientId = req.params.patientId || (req.query.patientId as string);
     const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : (rawPatientId as string);
-    const filter: Record<string, any> = {};
+
+    let effectivePatientId: string | undefined;
 
     if (patientId) {
-      const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-      const patient = await Patient.findOne({
-        $or: [{ patientId }, { _id: isValidObjectId ? patientId : null }],
-      });
-
+      const patient = await getPatientById(patientId);
       if (!patient) {
         res.status(404).json({
           success: false,
@@ -72,19 +64,16 @@ export const getPatientConsultations = async (
         });
         return;
       }
-      filter.patientId = patient.patientId;
+      effectivePatientId = patient.patientId;
     }
 
-    const consultations = await Consultation.find(filter).sort({ consultationDate: -1, createdAt: -1 });
+    const consultations = await listConsultations({ patientId: effectivePatientId });
 
     const isReception = req.user?.role === "RECEPTION" || req.user?.role === "RECEPTIONIST";
-    const data = isReception
-      ? consultations.map(c => sanitizeForReception(c))
-      : consultations.map(c => ({
-          ...c.toObject(),
-          id: c.consultationId,
-          date: c.consultationDate,
-        }));
+    const data = consultations.map((c) => {
+      const item = formatConsultation(c);
+      return isReception ? sanitizeForReception(item) : item;
+    });
 
     res.status(200).json({
       success: true,
@@ -108,11 +97,8 @@ export const getConsultationById = async (
   try {
     const rawConsultationId = req.params.consultationId || req.params.id;
     const consultationId = Array.isArray(rawConsultationId) ? rawConsultationId[0] : (rawConsultationId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(consultationId);
 
-    const consultation = await Consultation.findOne({
-      $or: [{ consultationId }, { _id: isValidObjectId ? consultationId : null }],
-    });
+    const consultation = await getConsultationRecord(consultationId);
 
     if (!consultation) {
       res.status(404).json({
@@ -122,39 +108,37 @@ export const getConsultationById = async (
       return;
     }
 
-    // Check optional patientId parameter mismatch
-    if (req.params.patientId && consultation.patientId !== req.params.patientId) {
-      const patient = await Patient.findOne({ patientId: req.params.patientId });
-      if (!patient || consultation.patientId !== patient.patientId) {
+    // Nested patient route must never disclose another chart's consultation.
+    const rawPatientId = req.params.patientId;
+    const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : rawPatientId;
+    if (patientId && consultation.patientId !== patientId) {
+      const patient = await getPatientById(patientId);
+      if (!patient || patient.patientId !== consultation.patientId) {
         res.status(404).json({
           success: false,
-          error: `Consultation ${consultationId} does not belong to patient ${req.params.patientId}`,
+          error: `Consultation record not found for ID: ${consultationId}`,
         });
         return;
       }
     }
 
     const isReception = req.user?.role === "RECEPTION" || req.user?.role === "RECEPTIONIST";
-    const data = isReception
-      ? sanitizeForReception(consultation)
-      : {
-          ...consultation.toObject(),
-          id: consultation.consultationId,
-          date: consultation.consultationDate,
-        };
+    const formatted = formatConsultation(consultation);
 
     res.status(200).json({
       success: true,
-      data,
+      data: isReception ? sanitizeForReception(formatted) : formatted,
     });
   } catch (error) {
     next(error);
   }
 };
 
+
 /**
  * POST /api/patients/:patientId/consultations (and POST /api/consultations)
- * Create a new chronological consultation record (DOCTOR & ADMIN only)
+ * Document a clinical consultation together with its derived prescription,
+ * follow-up task and patient chart timestamps (atomic when a pg pool exists).
  */
 export const createConsultation = async (
   req: Request,
@@ -162,101 +146,77 @@ export const createConsultation = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    if (req.user?.role === "RECEPTION" || req.user?.role === "RECEPTIONIST") {
-      res.status(403).json({
-        success: false,
-        error: "Access denied. Reception staff are not authorized to create clinical consultations.",
-      });
-      return;
-    }
+    const rawPatientId = req.params.patientId || req.body.patientId;
+    const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : (rawPatientId as string);
 
-    const targetPatientId = req.params.patientId || req.body.patientId;
-    if (!targetPatientId) {
-      res.status(400).json({
-        success: false,
-        error: "Patient ID reference is required to create a consultation.",
-      });
-      return;
-    }
-
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetPatientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId: targetPatientId }, { _id: isValidObjectId ? targetPatientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       res.status(404).json({
         success: false,
-        error: `Patient record not found for ID: ${targetPatientId}`,
+        error: `Patient record not found for ID: ${patientId}`,
       });
       return;
     }
 
-    const consultationId = await generateConsultationId();
-    const doctorId = req.user?.userId || req.user?._id?.toString() || req.body.doctorId || "USR-001";
+    const doctorId = req.user?.userId || req.body.doctorId || "USR-001";
     const doctorName = req.user?.name || req.body.doctorName || "DR SHAHAB MUHAMMAD";
-    const consultationDate = req.body.consultationDate || req.body.date || new Date().toISOString().split("T")[0];
+    const settings = await getClinicSettings();
 
-    const newConsultation = new Consultation({
-      consultationId,
-      patientId: patient.patientId,
-      patientName: patient.fullName,
-      doctorId,
-      doctorName,
-      clinicianId: doctorId,
-      clinicianName: doctorName,
-      consultationDate,
-      time: req.body.time || "10:00 AM",
-      visitType: req.body.visitType || "Follow-up Consultation",
-      presentingComplaint: req.body.presentingComplaint,
-      clinicalObservations: req.body.clinicalObservations || req.body.presentingComplaint,
-      mentalStatusExam: req.body.mentalStatusExam || {},
-      assessment: req.body.assessment,
-      diagnosis: {
-        primaryICD: req.body.diagnosis?.primaryICD || "F90.2",
-        primaryTitle: req.body.diagnosis?.primaryTitle || "Unspecified Diagnosis",
-        secondaryICD: req.body.diagnosis?.secondaryICD || "",
-        secondaryTitle: req.body.diagnosis?.secondaryTitle || "",
+    const result = await createConsultationCascade({
+      consultation: {
+        consultationId: req.body.consultationId,
+        patientId: patient.patientId,
+        patientName: patient.fullName,
+        doctorId,
+        doctorName,
+        clinicianId: doctorId,
+        clinicianName: doctorName,
+        consultationDate: req.body.consultationDate || req.body.date,
+        time: req.body.time,
+        visitType: req.body.visitType,
+        presentingComplaint: req.body.presentingComplaint,
+        clinicalObservations: req.body.clinicalObservations,
+        mentalStatusExam: req.body.mentalStatusExam,
+        assessment: req.body.assessment,
+        diagnosis: req.body.diagnosis,
+        treatmentPlan: req.body.treatmentPlan,
+        medications: req.body.medications || [],
+        followUpDate: req.body.followUpDate || "",
+        followUpNotes: req.body.followUpNotes || "",
+        notes: req.body.notes || "",
       },
-      treatmentPlan: req.body.treatmentPlan,
-      medications: req.body.medications || [],
-      followUpDate: req.body.followUpDate || "",
-      followUpNotes: req.body.followUpNotes || "",
-      notes: req.body.notes || "",
+      patient: {
+        patientId: patient.patientId,
+        fullName: patient.fullName,
+        age: patient.age,
+        gender: patient.gender,
+        phone: patient.phone,
+      },
+      doctorLicense: settings.licenseNumber,
+      actorId: doctorId,
     });
 
-    await newConsultation.save();
-
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: 'CREATE',
-        module: 'CONSULTATION',
-        resourceId: consultationId,
-        patientRef: patient.patientId,
-        description: `Documented clinical consultation ${consultationId} for ${patient.fullName}`,
-      });
-    }
-
-    // Update patient metadata
-    patient.lastVisitDate = consultationDate;
-    if (req.body.followUpDate) {
-      patient.nextFollowUpDate = req.body.followUpDate;
-    }
-    await patient.save();
-
-    const formattedData = {
-      ...newConsultation.toObject(),
-      id: newConsultation.consultationId,
-      date: newConsultation.consultationDate,
-    };
+    await recordAuditEvent({
+      userId: doctorId,
+      userName: doctorName,
+      userRole: req.user?.role,
+      action: "CREATE",
+      module: "CONSULTATION",
+      resourceId: result.consultation.consultationId,
+      patientRef: patient.patientId,
+      description: `Documented clinical consultation ${result.consultation.consultationId} for ${patient.fullName}`,
+      metadata: {
+        prescriptionId: result.prescription?.prescriptionId,
+        followUpId: result.followUp?.followUpId,
+        transactional: result.transactional,
+      },
+    });
 
     res.status(201).json({
       success: true,
-      message: `Consultation record ${consultationId} saved for patient ${patient.fullName}`,
-      data: formattedData,
+      message: `Consultation record ${result.consultation.consultationId} saved for patient ${patient.fullName}`,
+      data: formatConsultation(result.consultation),
     });
   } catch (error) {
     next(error);
@@ -283,13 +243,10 @@ export const updateConsultation = async (
 
     const rawConsultationId = req.params.consultationId || req.params.id;
     const consultationId = Array.isArray(rawConsultationId) ? rawConsultationId[0] : (rawConsultationId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(consultationId);
 
-    const consultation = await Consultation.findOne({
-      $or: [{ consultationId }, { _id: isValidObjectId ? consultationId : null }],
-    });
+    const existing = await getConsultationRecord(consultationId);
 
-    if (!consultation) {
+    if (!existing) {
       res.status(404).json({
         success: false,
         error: `Consultation record not found for ID: ${consultationId}`,
@@ -313,24 +270,30 @@ export const updateConsultation = async (
       "consultationDate",
     ];
 
+    const updates: Record<string, any> = {};
     allowedUpdates.forEach((key) => {
       if (req.body[key] !== undefined) {
-        (consultation as any)[key] = req.body[key];
+        updates[key] = req.body[key];
       }
     });
 
-    await consultation.save();
+    const consultation = (await updateConsultationRecord(existing.consultationId, updates)) || existing;
 
-    const formattedData = {
-      ...consultation.toObject(),
-      id: consultation.consultationId,
-      date: consultation.consultationDate,
-    };
+    await recordAuditEvent({
+      userId: req.user?.userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      action: "UPDATE",
+      module: "CONSULTATION",
+      resourceId: consultation.consultationId,
+      patientRef: consultation.patientId,
+      description: `Updated clinical consultation ${consultation.consultationId}`,
+    });
 
     res.status(200).json({
       success: true,
       message: `Consultation record ${consultation.consultationId} updated successfully.`,
-      data: formattedData,
+      data: formatConsultation(consultation),
     });
   } catch (error) {
     next(error);

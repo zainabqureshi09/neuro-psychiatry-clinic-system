@@ -1,37 +1,30 @@
 import { Request, Response, NextFunction } from "express";
-import FeeCategory, { IFeeCategoryDoc } from "../../models/FeeCategory";
-import Payment, { IPaymentDoc } from "../../models/Payment";
-import Patient from "../../models/Patient";
 import { logger } from "../utils/logger";
 import { recordAuditEvent } from "../utils/auditLogger";
+import {
+  getFeeCategories as getFeeCategoriesRepo,
+  createFeeCategory as createFeeCategoryRepo,
+  updateFeeCategory as updateFeeCategoryRepo,
+  getPayments as getPaymentsRepo,
+  getPaymentById as getPaymentRecord,
+  recordPayment,
+  updatePayment as updatePaymentRecord,
+  getDailyFinancialReport,
+  getMonthlyFinancialReport,
+} from "../../lib/db/repositories/billingRepository";
+import { getPatientById } from "../../lib/db/repositories/patientRepository";
 
-/**
- * Helper to format FeeCategory document for API responses.
- */
-const formatFeeCategory = (doc: IFeeCategoryDoc) => {
-  const obj = doc.toObject ? doc.toObject() : { ...doc };
-  const formatted: Record<string, any> = {
-    ...obj,
-    id: obj.categoryId || obj.id || obj._id,
-  };
-  delete formatted._id;
-  delete formatted.__v;
-  return formatted;
-};
+/** Format a fee category for API responses. */
+const formatFeeCategory = (category: any) => ({
+  ...category,
+  id: category.categoryId || category.id,
+});
 
-/**
- * Helper to format Payment document for API responses.
- */
-const formatPayment = (doc: IPaymentDoc) => {
-  const obj = doc.toObject ? doc.toObject() : { ...doc };
-  const formatted: Record<string, any> = {
-    ...obj,
-    id: obj.paymentId || obj.id || obj._id,
-  };
-  delete formatted._id;
-  delete formatted.__v;
-  return formatted;
-};
+/** Format a payment for API responses. */
+const formatPayment = (payment: any) => ({
+  ...payment,
+  id: payment.paymentId || payment.id,
+});
 
 // ==========================================
 // FEE CATEGORY CONTROLLERS
@@ -41,16 +34,13 @@ const formatPayment = (doc: IPaymentDoc) => {
  * GET /api/fee-categories
  */
 export const getFeeCategories = async (
-  req: Request,
+  _req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
   try {
-    const categories = await FeeCategory.find().sort({ createdAt: 1 }).lean();
-    const formatted = categories.map((c: any) => ({
-      ...c,
-      id: c.categoryId || c.id || c._id,
-    }));
+    const categories = await getFeeCategoriesRepo();
+    const formatted = categories.map(formatFeeCategory);
 
     res.status(200).json({
       success: true,
@@ -76,7 +66,7 @@ export const createFeeCategory = async (
 ): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    const userId = req.user?.userId || req.user?.id;
+    const userId = req.user?.userId;
 
     if (userRole !== "ADMIN") {
       res.status(403).json({
@@ -97,10 +87,10 @@ export const createFeeCategory = async (
       return;
     }
 
-    const count = await FeeCategory.countDocuments();
-    const categoryId = req.body.categoryId || req.body.id || `FEE-${100 + count + 1}`;
+    const existing = await getFeeCategoriesRepo();
+    const categoryId = req.body.categoryId || req.body.id || `FEE-${100 + existing.length + 1}`;
 
-    const newCategory = new FeeCategory({
+    const newCategory = await createFeeCategoryRepo({
       categoryId,
       name,
       defaultFee: feeValue,
@@ -111,8 +101,17 @@ export const createFeeCategory = async (
       updatedBy: userId,
     });
 
-    await newCategory.save();
-    logger.info(`Created fee category '${name}' (${categoryId}) by admin ${userId}`);
+    logger.info(`Created fee category '${name}' (${newCategory.categoryId}) by admin ${userId}`);
+
+    await recordAuditEvent({
+      userId: userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole,
+      action: "CREATE",
+      module: "BILLING",
+      resourceId: newCategory.categoryId,
+      description: `Created fee category '${name}' (${newCategory.categoryId}) at ${feeValue}`,
+    });
 
     res.status(201).json({
       success: true,
@@ -138,7 +137,7 @@ export const updateFeeCategory = async (
 ): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    const userId = req.user?.userId || req.user?.id;
+    const userId = req.user?.userId;
 
     if (userRole !== "ADMIN") {
       res.status(403).json({
@@ -150,11 +149,9 @@ export const updateFeeCategory = async (
 
     const rawId = req.params.id;
     const targetId = Array.isArray(rawId) ? rawId[0] : (rawId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetId);
 
-    const category = await FeeCategory.findOne({
-      $or: [{ categoryId: targetId }, { _id: isValidObjectId ? targetId : null }],
-    });
+    const categories = await getFeeCategoriesRepo();
+    const category = categories.find((c) => c.categoryId === targetId);
 
     if (!category) {
       res.status(404).json({
@@ -164,7 +161,7 @@ export const updateFeeCategory = async (
       return;
     }
 
-    const updates = { ...req.body };
+    const updates: Record<string, any> = { ...req.body };
     delete updates._id;
     delete updates.id;
     delete updates.categoryId;
@@ -182,15 +179,28 @@ export const updateFeeCategory = async (
       updates.amount = feeVal;
     }
 
-    Object.assign(category, updates, { updatedBy: userId });
-    await category.save();
+    const updated =
+      (await updateFeeCategoryRepo(category.categoryId, {
+        ...updates,
+        updatedBy: userId,
+      })) || category;
 
-    logger.info(`Updated fee category '${category.name}' (${category.categoryId})`);
+    logger.info(`Updated fee category '${updated.name}' (${updated.categoryId})`);
+
+    await recordAuditEvent({
+      userId: userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole,
+      action: "UPDATE",
+      module: "BILLING",
+      resourceId: updated.categoryId,
+      description: `Updated fee category '${updated.name}' (${updated.categoryId})`,
+    });
 
     res.status(200).json({
       success: true,
-      message: `Fee category '${category.name}' updated successfully.`,
-      data: formatFeeCategory(category),
+      message: `Fee category '${updated.name}' updated successfully.`,
+      data: formatFeeCategory(updated),
     });
   } catch (error: any) {
     logger.error("Error updating fee category:", error.message || error);
@@ -200,6 +210,7 @@ export const updateFeeCategory = async (
     });
   }
 };
+
 
 // ==========================================
 // PAYMENT CONTROLLERS
@@ -226,20 +237,14 @@ export const getPayments = async (
       return;
     }
 
-    const filter: any = {};
-    if (patientId) filter.patientId = patientId;
-    if (date) filter.date = date;
-    if (status) filter.paymentStatus = new RegExp(`^${status}$`, "i");
+    const payments = await getPaymentsRepo({
+      patientId: patientId ? String(patientId) : undefined,
+      date: date ? String(date) : undefined,
+      month: month ? String(month) : undefined,
+      status: status ? String(status) : undefined,
+    });
 
-    if (month && typeof month === "string") {
-      filter.date = new RegExp(`^${month}`);
-    }
-
-    const payments = await Payment.find(filter).sort({ createdAt: -1 }).lean();
-    const formatted = payments.map((p: any) => ({
-      ...p,
-      id: p.paymentId || p.id || p._id,
-    }));
+    const formatted = payments.map(formatPayment);
 
     res.status(200).json({
       success: true,
@@ -276,11 +281,8 @@ export const getPaymentById = async (
 
     const rawId = req.params.id;
     const targetId = Array.isArray(rawId) ? rawId[0] : (rawId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetId);
 
-    const payment = await Payment.findOne({
-      $or: [{ paymentId: targetId }, { receiptNumber: targetId }, { _id: isValidObjectId ? targetId : null }],
-    });
+    const payment = await getPaymentRecord(targetId);
 
     if (!payment) {
       res.status(404).json({
@@ -323,7 +325,7 @@ export const getPatientPayments = async (
       return;
     }
 
-    const patient = await Patient.findOne({ patientId, isActive: true });
+    const patient = await getPatientById(String(patientId), { includeInactive: false });
     if (!patient) {
       res.status(404).json({
         success: false,
@@ -332,11 +334,8 @@ export const getPatientPayments = async (
       return;
     }
 
-    const payments = await Payment.find({ patientId }).sort({ createdAt: -1 }).lean();
-    const formatted = payments.map((p: any) => ({
-      ...p,
-      id: p.paymentId || p.id || p._id,
-    }));
+    const payments = await getPaymentsRepo({ patientId: patient.patientId });
+    const formatted = payments.map(formatPayment);
 
     res.status(200).json({
       success: true,
@@ -352,8 +351,10 @@ export const getPatientPayments = async (
   }
 };
 
+
 /**
  * POST /api/payments
+ * Records an immutable receipt through the repository (atomic when a pg pool exists).
  */
 export const createPayment = async (
   req: Request,
@@ -362,7 +363,7 @@ export const createPayment = async (
 ): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    const userId = req.user?.userId || req.user?.id;
+    const userId = req.user?.userId;
     const userName = req.user?.name || "Staff";
 
     // Only ADMIN and RECEPTION can process payments
@@ -374,7 +375,8 @@ export const createPayment = async (
       return;
     }
 
-    const { patientId, amount, service, feeCategory, feeCategoryId, paymentMethod, paymentStatus, notes, date } = req.body;
+    const { patientId, amount, service, feeCategory, feeCategoryId, paymentMethod, paymentStatus, notes, date } =
+      req.body;
 
     if (!patientId) {
       res.status(400).json({
@@ -384,7 +386,7 @@ export const createPayment = async (
       return;
     }
 
-    const patient = await Patient.findOne({ patientId, isActive: true });
+    const patient = await getPatientById(patientId, { includeInactive: false });
     if (!patient) {
       res.status(404).json({
         success: false,
@@ -402,26 +404,17 @@ export const createPayment = async (
       return;
     }
 
-    const totalCount = await Payment.countDocuments();
-    const generatedPaymentId = req.body.paymentId || req.body.id || `PY-${400 + totalCount + 1}`;
-    
-    // BACKEND RECEIPT NUMBER GENERATION LOGIC
-    const currentYear = new Date().getFullYear();
-    const receiptSeq = String(totalCount + 101).padStart(4, "0");
-    const generatedReceiptNumber = req.body.receiptNumber && req.body.receiptNumber.startsWith("RCP-") 
-      ? req.body.receiptNumber 
-      : `RCP-${currentYear}-${receiptSeq}`;
+    const paymentDate = date || new Date().toISOString().split("T")[0];
 
-    const paymentDate = date || req.body.paymentDate || new Date().toISOString().split("T")[0];
-
-    const newPayment = new Payment({
-      paymentId: generatedPaymentId,
-      receiptNumber: generatedReceiptNumber,
+    const newPayment = await recordPayment({
+      paymentId: req.body.paymentId || req.body.id,
+      // Receipt numbers are generated server-side; client values cannot override them.
+      receiptNumber: undefined,
       patientId: patient.patientId,
-      patientName: req.body.patientName || patient.fullName,
-      appointmentId: req.body.appointmentId || "",
-      consultationId: req.body.consultationId || "",
-      feeCategoryId: feeCategoryId || "",
+      patientName: patient.fullName,
+      appointmentId: req.body.appointmentId,
+      consultationId: req.body.consultationId,
+      feeCategoryId,
       service: service || "Consultation Service",
       feeCategory: feeCategory || "Consultation",
       amount: paymentAmount,
@@ -431,26 +424,25 @@ export const createPayment = async (
       paymentDate,
       notes: notes || "",
       receivedBy: userName,
-      createdBy: userId,
-      updatedBy: userId,
+      createdBy: userId || "SYSTEM",
+      updatedBy: userId || "SYSTEM",
     });
 
-    await newPayment.save();
+    await recordAuditEvent({
+      userId: userId || "SYSTEM",
+      userName,
+      userRole,
+      action: "CREATE",
+      module: "BILLING",
+      resourceId: newPayment.paymentId,
+      patientRef: patient.patientId,
+      description: `Processed payment ${newPayment.paymentId} (Receipt ${newPayment.receiptNumber}) for ${patient.fullName}`,
+      metadata: { amount: paymentAmount, paymentMethod: newPayment.paymentMethod },
+    });
 
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: "CREATE",
-        module: "BILLING",
-        resourceId: newPayment.paymentId,
-        patientRef: patient.patientId,
-        description: `Processed payment ${newPayment.paymentId} ($${paymentAmount}, Receipt ${newPayment.receiptNumber}) for ${patient.fullName}`,
-      });
-    }
-
-    logger.info(`Processed payment ${newPayment.paymentId} (Receipt ${newPayment.receiptNumber}) for $${paymentAmount} by ${userName}`);
+    logger.info(
+      `Processed payment ${newPayment.paymentId} (Receipt ${newPayment.receiptNumber}) for $${paymentAmount} by ${userName}`
+    );
 
     res.status(201).json({
       success: true,
@@ -468,6 +460,7 @@ export const createPayment = async (
 
 /**
  * PUT /api/payments/:id
+ * Receipt numbers are strictly immutable and can never be altered.
  */
 export const updatePayment = async (
   req: Request,
@@ -476,7 +469,7 @@ export const updatePayment = async (
 ): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    const userId = req.user?.userId || req.user?.id;
+    const userId = req.user?.userId;
 
     if (userRole !== "ADMIN" && userRole !== "RECEPTION" && userRole !== "RECEPTIONIST") {
       res.status(403).json({
@@ -488,13 +481,10 @@ export const updatePayment = async (
 
     const rawId = req.params.id;
     const targetId = Array.isArray(rawId) ? rawId[0] : (rawId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetId);
 
-    const payment = await Payment.findOne({
-      $or: [{ paymentId: targetId }, { receiptNumber: targetId }, { _id: isValidObjectId ? targetId : null }],
-    });
+    const existing = await getPaymentRecord(targetId);
 
-    if (!payment) {
+    if (!existing) {
       res.status(404).json({
         success: false,
         error: `Payment record '${targetId}' not found.`,
@@ -502,7 +492,7 @@ export const updatePayment = async (
       return;
     }
 
-    const updates = { ...req.body };
+    const updates: Record<string, any> = { ...req.body };
     delete updates._id;
     delete updates.id;
     delete updates.paymentId;
@@ -520,8 +510,21 @@ export const updatePayment = async (
       updates.amount = amtVal;
     }
 
-    Object.assign(payment, updates, { updatedBy: userId });
-    await payment.save();
+    const payment = (await updatePaymentRecord(existing.paymentId, {
+      ...updates,
+      updatedBy: userId,
+    })) || existing;
+
+    await recordAuditEvent({
+      userId: userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole,
+      action: "UPDATE",
+      module: "BILLING",
+      resourceId: payment.paymentId,
+      patientRef: payment.patientId,
+      description: `Updated payment record ${payment.paymentId} (Receipt ${payment.receiptNumber} preserved)`,
+    });
 
     logger.info(`Updated payment record ${payment.paymentId} (Receipt ${payment.receiptNumber})`);
 
@@ -541,6 +544,7 @@ export const updatePayment = async (
 
 /**
  * GET /api/payments/:id/receipt
+ * Generates the printable receipt payload from the stored, immutable record.
  */
 export const getPaymentReceipt = async (
   req: Request,
@@ -550,11 +554,8 @@ export const getPaymentReceipt = async (
   try {
     const rawId = req.params.id;
     const targetId = Array.isArray(rawId) ? rawId[0] : (rawId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetId);
 
-    const payment = await Payment.findOne({
-      $or: [{ paymentId: targetId }, { receiptNumber: targetId }, { _id: isValidObjectId ? targetId : null }],
-    });
+    const payment = await getPaymentRecord(targetId);
 
     if (!payment) {
       res.status(404).json({
@@ -623,34 +624,11 @@ export const getDailyCollectionReport = async (
     }
 
     const targetDate = (req.query.date as string) || new Date().toISOString().split("T")[0];
-
-    const payments = await Payment.find({
-      date: targetDate,
-      paymentStatus: { $in: ["Paid", "PAID"] },
-    }).lean();
-
-    const totalCollected = payments.reduce((acc, p) => acc + p.amount, 0);
-
-    const methodBreakdown: Record<string, number> = {};
-    const categoryBreakdown: Record<string, number> = {};
-
-    payments.forEach((p) => {
-      const method = p.paymentMethod || "Other";
-      const cat = p.feeCategory || "Consultation";
-      methodBreakdown[method] = (methodBreakdown[method] || 0) + p.amount;
-      categoryBreakdown[cat] = (categoryBreakdown[cat] || 0) + p.amount;
-    });
+    const report = await getDailyFinancialReport(targetDate);
 
     res.status(200).json({
       success: true,
-      data: {
-        date: targetDate,
-        totalCollected,
-        paymentCount: payments.length,
-        methodBreakdown,
-        categoryBreakdown,
-        payments: payments.map((p: any) => formatPayment(p)),
-      },
+      data: report,
     });
   } catch (error: any) {
     logger.error("Error calculating daily collection report:", error.message || error);
@@ -685,42 +663,18 @@ export const getMonthlyCollectionReport = async (
 
     if (month.length === 1) month = `0${month}`;
 
-    const monthPrefix = `${year}-${month}`;
-
-    const payments = await Payment.find({
-      date: new RegExp(`^${monthPrefix}`),
-      paymentStatus: { $in: ["Paid", "PAID"] },
-    }).lean();
-
-    const totalCollected = payments.reduce((acc, p) => acc + p.amount, 0);
-
-    const dailyTotals: Record<string, { total: number; count: number }> = {};
-
-    payments.forEach((p) => {
-      const d = p.date;
-      if (!dailyTotals[d]) {
-        dailyTotals[d] = { total: 0, count: 0 };
-      }
-      dailyTotals[d].total += p.amount;
-      dailyTotals[d].count += 1;
-    });
+    const report = await getMonthlyFinancialReport(year, month);
 
     res.status(200).json({
       success: true,
-      data: {
-        year,
-        month,
-        period: monthPrefix,
-        totalCollected,
-        paymentCount: payments.length,
-        dailyTotals,
-      },
+      data: report,
     });
   } catch (error: any) {
     logger.error("Error calculating monthly collection report:", error.message || error);
     res.status(500).json({
       success: false,
-      error: "Internal server error while calculating monthly collection metrics.",
+      error: "Internal server error while calculating monthly collections.",
     });
   }
 };
+

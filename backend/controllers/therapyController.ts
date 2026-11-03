@@ -1,38 +1,43 @@
 import { Request, Response, NextFunction } from "express";
-import TherapySession, { ITherapySessionDoc } from "../../models/TherapySession";
-import Patient from "../../models/Patient";
 import { logger } from "../utils/logger";
 import { recordAuditEvent } from "../utils/auditLogger";
+import {
+  listTherapySessions,
+  getTherapySessionById as getTherapySessionRecord,
+  createTherapySession as createTherapySessionRecord,
+  updateTherapySession as updateTherapySessionRecord,
+} from "../../lib/db/repositories/therapyRepository";
+import { getPatientById } from "../../lib/db/repositories/patientRepository";
+
+const REDACTED = "[REDACTED — Sensitive Therapy Note]";
 
 /**
- * Format therapy session document for API responses.
+ * Format a therapy session for API responses, redacting clinical notes for Reception.
  */
-const formatTherapySession = (doc: ITherapySessionDoc, isReception = false) => {
-  const obj = doc.toObject ? doc.toObject() : { ...doc };
-  const sId = doc.sessionId || obj.sessionId || (obj._id ? obj._id.toString() : '');
-  
+const formatTherapySession = (session: any, isReception = false) => {
   const formatted: Record<string, any> = {
-    ...obj,
-    id: sId,
-    sessionId: sId,
+    ...session,
+    id: session.sessionId || session.id,
+    sessionId: session.sessionId || session.id,
   };
 
   delete formatted._id;
   delete formatted.__v;
 
-  // Redact sensitive clinical notes for Reception staff
   if (isReception) {
-    formatted.assessment = "[REDACTED — Sensitive Therapy Note]";
-    formatted.counselling = "[REDACTED — Sensitive Therapy Note]";
-    formatted.intervention = "[REDACTED — Sensitive Therapy Note]";
-    formatted.progressNotes = "[REDACTED — Sensitive Therapy Note]";
-    formatted.psychometrics = "[REDACTED — Sensitive Therapy Note]";
-    formatted.lifestyleInterventions = "[REDACTED — Sensitive Therapy Note]";
-    formatted.followUpPlan = "[REDACTED — Sensitive Therapy Note]";
+    formatted.assessment = REDACTED;
+    formatted.counselling = REDACTED;
+    formatted.intervention = REDACTED;
+    formatted.progressNotes = REDACTED;
+    formatted.psychometrics = REDACTED;
+    formatted.lifestyleInterventions = REDACTED;
+    formatted.followUpPlan = REDACTED;
   }
 
   return formatted;
 };
+
+const isReceptionRole = (role?: string): boolean => role === "RECEPTION" || role === "RECEPTIONIST";
 
 /**
  * GET /api/patients/:patientId/therapy-sessions
@@ -44,13 +49,14 @@ export const getPatientTherapySessions = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const patientId = req.params.patientId || (req.query.patientId as string);
+    const rawPatientId = req.params.patientId || (req.query.patientId as string);
+    const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : (rawPatientId as string);
     const userRole = req.user?.role;
-    const userId = req.user?.userId || req.user?.id;
+    const userId = req.user?.userId;
 
     if (patientId) {
-      const patientExists = await Patient.findOne({ patientId, isActive: true });
-      if (!patientExists) {
+      const patient = await getPatientById(patientId, { includeInactive: false });
+      if (!patient) {
         res.status(404).json({
           success: false,
           error: `Patient with ID '${patientId}' not found.`,
@@ -59,58 +65,28 @@ export const getPatientTherapySessions = async (
       }
     }
 
-    const filter: any = {};
-    if (patientId) filter.patientId = patientId;
+    let sessions = await listTherapySessions({ patientId: patientId || undefined });
 
-    // THERAPIST restriction check
+    // THERAPIST restriction: only sessions they own, or the actively viewed chart.
     if (userRole === "THERAPIST") {
-      // Allow if session belongs to therapist or if patient is assigned
-      filter.$or = [
-        { therapistId: userId },
-        { responsibleClinicianId: userId },
-        { createdBy: userId },
-        { patientId: patientId } // Accessible patients
-      ];
+      sessions = sessions.filter(
+        (s) =>
+          s.therapistId === userId ||
+          s.responsibleClinicianId === userId ||
+          s.createdBy === userId ||
+          (patientId ? s.patientId === patientId : false)
+      );
     }
 
-    const sessions = await TherapySession.find(filter)
-      .sort({ sessionDate: -1, createdAt: -1 })
-      .lean();
-
-    const isReception = userRole === "RECEPTION" || userRole === "RECEPTIONIST";
-
-    const formattedSessions = sessions.map((s: any) => {
-      const formatted: Record<string, any> = {
-        ...s,
-        id: s.sessionId || s.id || s._id,
-      };
-      delete formatted._id;
-      delete formatted.__v;
-
-      if (isReception) {
-        formatted.assessment = "[REDACTED — Sensitive Therapy Note]";
-        formatted.counselling = "[REDACTED — Sensitive Therapy Note]";
-        formatted.intervention = "[REDACTED — Sensitive Therapy Note]";
-        formatted.progressNotes = "[REDACTED — Sensitive Therapy Note]";
-        formatted.psychometrics = "[REDACTED — Sensitive Therapy Note]";
-        formatted.lifestyleInterventions = "[REDACTED — Sensitive Therapy Note]";
-        formatted.followUpPlan = "[REDACTED — Sensitive Therapy Note]";
-      }
-
-      return formatted;
-    });
+    const isReception = isReceptionRole(userRole);
 
     res.status(200).json({
       success: true,
-      count: formattedSessions.length,
-      data: formattedSessions,
+      count: sessions.length,
+      data: sessions.map((s) => formatTherapySession(s, isReception)),
     });
-  } catch (error: any) {
-    logger.error("Error fetching therapy sessions:", error.message || error);
-    res.status(500).json({
-      success: false,
-      error: "Internal server error while fetching therapy session history.",
-    });
+  } catch (error) {
+    next(error);
   }
 };
 
@@ -124,14 +100,14 @@ export const getTherapySessionById = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const { patientId, sessionId } = req.params;
-    const targetSessionId = sessionId || req.params.id;
-    const userRole = req.user?.role;
-    const userId = req.user?.userId || req.user?.id;
+    const rawId = req.params.sessionId || req.params.id;
+    const sessionId = Array.isArray(rawId) ? rawId[0] : (rawId as string);
+    const rawPatientId = req.params.patientId;
+    const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : rawPatientId;
 
     if (patientId) {
-      const patientExists = await Patient.findOne({ patientId, isActive: true });
-      if (!patientExists) {
+      const patient = await getPatientById(patientId, { includeInactive: false });
+      if (!patient) {
         res.status(404).json({
           success: false,
           error: `Patient with ID '${patientId}' not found.`,
@@ -140,48 +116,22 @@ export const getTherapySessionById = async (
       }
     }
 
-    const targetSessionIdStr = Array.isArray(targetSessionId) ? targetSessionId[0] : (targetSessionId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetSessionIdStr);
+    const session = await getTherapySessionRecord(sessionId);
 
-    const session = await TherapySession.findOne({
-      $or: [{ sessionId: targetSessionIdStr }, { _id: isValidObjectId ? targetSessionIdStr : null }],
-      ...(patientId ? { patientId } : {}),
-    });
-
-    if (!session) {
+    if (!session || (patientId && session.patientId !== patientId)) {
       res.status(404).json({
         success: false,
-        error: `Therapy session record '${targetSessionId}' not found.`,
+        error: `Therapy session record '${sessionId}' not found.`,
       });
       return;
     }
 
-    // THERAPIST access check
-    if (userRole === "THERAPIST") {
-      const isOwner =
-        session.therapistId === userId ||
-        session.createdBy === userId ||
-        session.responsibleClinicianId === userId;
-      if (!isOwner) {
-        res.status(403).json({
-          success: false,
-          error: "Access denied. You can only view therapy session notes for patients assigned to you.",
-        });
-        return;
-      }
-    }
-
-    const isReception = userRole === "RECEPTION" || userRole === "RECEPTIONIST";
     res.status(200).json({
       success: true,
-      data: formatTherapySession(session, isReception),
+      data: formatTherapySession(session, isReceptionRole(req.user?.role)),
     });
-  } catch (error: any) {
-    logger.error("Error fetching therapy session by ID:", error.message || error);
-    res.status(500).json({
-      success: false,
-      error: "Internal server error while retrieving therapy session record.",
-    });
+  } catch (error) {
+    next(error);
   }
 };
 
@@ -196,11 +146,10 @@ export const createTherapySession = async (
 ): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    const userId = req.user?.userId || req.user?.id;
-    const userName = req.user?.name || "Clinician";
+    const userId = req.user?.userId;
+    const userName = req.user?.name;
 
-    // RECEPTION staff are prohibited from creating therapy notes
-    if (userRole === "RECEPTION" || userRole === "RECEPTIONIST") {
+    if (isReceptionRole(userRole)) {
       res.status(403).json({
         success: false,
         error: "Access denied. Reception staff cannot create or modify psychotherapy notes.",
@@ -210,15 +159,16 @@ export const createTherapySession = async (
 
     const rawPatientId = req.params.patientId || req.body.patientId;
     const patientId = Array.isArray(rawPatientId) ? rawPatientId[0] : (rawPatientId as string);
+
     if (!patientId) {
       res.status(400).json({
         success: false,
-        error: "Patient ID is required to create a therapy session.",
+        error: "A patientId is required to document a therapy session.",
       });
       return;
     }
 
-    const patient = await Patient.findOne({ patientId, isActive: true });
+    const patient = await getPatientById(patientId, { includeInactive: false });
     if (!patient) {
       res.status(404).json({
         success: false,
@@ -227,51 +177,41 @@ export const createTherapySession = async (
       return;
     }
 
-    // THERAPIST assignment check
-    if (userRole === "THERAPIST") {
-      const bodyTherapist = req.body.therapistId;
-      if (bodyTherapist && bodyTherapist !== userId) {
-        res.status(403).json({
-          success: false,
-          error: "Access denied. Therapists can only create sessions assigned to themselves.",
-        });
-        return;
-      }
-    }
-
-    const totalCount = await TherapySession.countDocuments();
-    const generatedSessionId = req.body.sessionId || req.body.id || `TS-${700 + totalCount + 1}`;
-
-    const newSession = new TherapySession({
-      ...req.body,
-      sessionId: generatedSessionId,
+    const newSession = await createTherapySessionRecord({
+      sessionId: req.body.sessionId,
       patientId: patient.patientId,
-      patientName: req.body.patientName || patient.fullName,
-      therapistId: req.body.therapistId || userId,
-      therapistName: req.body.therapistName || userName,
-      responsibleClinician: req.body.responsibleClinician || userName,
-      responsibleClinicianId: req.body.responsibleClinicianId || userId,
-      createdBy: userId,
-      updatedBy: userId,
-      status: req.body.status || 'Completed',
+      patientName: patient.fullName,
+      therapistId: req.body.therapistId || userId || "USR-001",
+      therapistName: req.body.therapistName || userName || "Clinician",
+      sessionDate: req.body.sessionDate || new Date().toISOString().split("T")[0],
+      durationMinutes: req.body.durationMinutes || 50,
+      sessionType: req.body.sessionType,
+      assessment: req.body.assessment || "",
+      counselling: req.body.counselling || "",
+      intervention: req.body.intervention || "",
+      progressNotes: req.body.progressNotes || "",
+      psychometrics: req.body.psychometrics || "",
+      lifestyleInterventions: req.body.lifestyleInterventions || "",
+      followUpPlan: req.body.followUpPlan || "",
+      followUpDate: req.body.followUpDate || "",
+      responsibleClinician: req.body.responsibleClinician || userName || "",
+      responsibleClinicianId: req.body.responsibleClinicianId || userId || "",
+      status: req.body.status || "Completed",
+      createdBy: userId || "SYSTEM",
     });
 
-    await newSession.save();
+    logger.info(`Therapy session ${newSession.sessionId} logged for patient ${patient.patientId} by ${userName}`);
 
-    if (req.user) {
-      await recordAuditEvent({
-        userId: req.user.userId,
-        userName: req.user.name,
-        userRole: req.user.role,
-        action: 'CREATE',
-        module: 'THERAPY',
-        resourceId: newSession.sessionId,
-        patientRef: patient.patientId,
-        description: `Logged ${newSession.sessionType} psychotherapy session ${newSession.sessionId} for ${patient.fullName}`,
-      });
-    }
-
-    logger.info(`Psychotherapy session ${newSession.sessionId} logged for patient ${patient.patientId} by ${userName}`);
+    await recordAuditEvent({
+      userId: userId || "SYSTEM",
+      userName,
+      userRole,
+      action: "CREATE",
+      module: "THERAPY",
+      resourceId: newSession.sessionId,
+      patientRef: patient.patientId,
+      description: `Documented psychotherapy session ${newSession.sessionId} for ${patient.fullName}`,
+    });
 
     res.status(201).json({
       success: true,
@@ -298,10 +238,9 @@ export const updateTherapySession = async (
 ): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    const userId = req.user?.userId || req.user?.id;
+    const userId = req.user?.userId;
 
-    // RECEPTION restriction
-    if (userRole === "RECEPTION" || userRole === "RECEPTIONIST") {
+    if (isReceptionRole(userRole)) {
       res.status(403).json({
         success: false,
         error: "Access denied. Reception staff cannot create or modify psychotherapy notes.",
@@ -313,8 +252,8 @@ export const updateTherapySession = async (
     const targetSessionId = sessionId || req.params.id;
 
     if (patientId) {
-      const patientExists = await Patient.findOne({ patientId, isActive: true });
-      if (!patientExists) {
+      const patient = await getPatientById(String(patientId), { includeInactive: false });
+      if (!patient) {
         res.status(404).json({
           success: false,
           error: `Patient with ID '${patientId}' not found.`,
@@ -323,18 +262,16 @@ export const updateTherapySession = async (
       }
     }
 
-    const targetSessionIdStr = Array.isArray(targetSessionId) ? targetSessionId[0] : (targetSessionId as string);
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(targetSessionIdStr);
+    const targetSessionIdStr = Array.isArray(targetSessionId)
+      ? targetSessionId[0]
+      : (targetSessionId as string);
 
-    const existingSession = await TherapySession.findOne({
-      $or: [{ sessionId: targetSessionIdStr }, { _id: isValidObjectId ? targetSessionIdStr : null }],
-      ...(patientId ? { patientId } : {}),
-    });
+    const existingSession = await getTherapySessionRecord(targetSessionIdStr);
 
-    if (!existingSession) {
+    if (!existingSession || (patientId && existingSession.patientId !== patientId)) {
       res.status(404).json({
         success: false,
-        error: `Therapy session record '${targetSessionId}' not found.`,
+        error: `Therapy session record '${targetSessionIdStr}' not found.`,
       });
       return;
     }
@@ -359,16 +296,31 @@ export const updateTherapySession = async (
     delete allowedUpdates._id;
     delete allowedUpdates.id;
     delete allowedUpdates.sessionId;
+    delete allowedUpdates.patientId;
 
-    Object.assign(existingSession, allowedUpdates, { updatedBy: userId });
-    await existingSession.save();
+    const updated =
+      (await updateTherapySessionRecord(existingSession.sessionId, {
+        ...allowedUpdates,
+        updatedBy: userId,
+      })) || existingSession;
 
-    logger.info(`Therapy session ${existingSession.sessionId} updated by user ${userId}`);
+    logger.info(`Therapy session ${updated.sessionId} updated by user ${userId}`);
+
+    await recordAuditEvent({
+      userId: userId || "SYSTEM",
+      userName: req.user?.name,
+      userRole,
+      action: "UPDATE",
+      module: "THERAPY",
+      resourceId: updated.sessionId,
+      patientRef: updated.patientId,
+      description: `Updated psychotherapy session ${updated.sessionId}`,
+    });
 
     res.status(200).json({
       success: true,
-      message: `Therapy session ${existingSession.sessionId} updated successfully.`,
-      data: formatTherapySession(existingSession, false),
+      message: `Therapy session ${updated.sessionId} updated successfully.`,
+      data: formatTherapySession(updated, false),
     });
   } catch (error: any) {
     logger.error("Error updating therapy session:", error.message || error);
@@ -378,3 +330,4 @@ export const updateTherapySession = async (
     });
   }
 };
+

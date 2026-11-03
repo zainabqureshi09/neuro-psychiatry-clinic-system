@@ -1,6 +1,15 @@
 import { Request, Response, NextFunction } from 'express';
-import User, { IUserPermissions, UserRole } from '../../models/User';
+import { IUserPermissions, UserRole } from '../../models/User';
 import { recordAuditEvent } from '../utils/auditLogger';
+import {
+  listUsers,
+  findUserByEmail,
+  findUserById,
+  countUsers,
+  createUser as createUserRecord,
+  updateUser as updateUserRecord,
+} from '../../lib/db/repositories/userRepository';
+import { toPublicUser } from './authController';
 
 const getDefaultPermissionsForRole = (role: UserRole): IUserPermissions => {
   switch (role) {
@@ -33,14 +42,6 @@ const getDefaultPermissionsForRole = (role: UserRole): IUserPermissions => {
       };
     case 'RECEPTION':
     case 'RECEPTIONIST':
-      return {
-        canWriteClinicalNotes: false,
-        canPrescribe: false,
-        canManagePatients: true,
-        canManageAppointments: true,
-        canManageUsers: false,
-        canViewReports: false,
-      };
     default:
       return {
         canWriteClinicalNotes: false,
@@ -61,18 +62,16 @@ export const getUsers = async (req: Request, res: Response, next: NextFunction):
   try {
     const page = Math.max(1, parseInt((req.query.page || '1').toString(), 10));
     const limit = Math.max(1, Math.min(100, parseInt((req.query.limit || '50').toString(), 10)));
-    const skip = (page - 1) * limit;
 
-    const total = await User.countDocuments();
-    const users = await User.find()
-      .select('-passwordHash -__v')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
+    const users = await listUsers();
+    // Newest accounts first (repository returns ascending creation order)
+    const ordered = [...users].reverse();
+    const total = ordered.length;
+    const paged = ordered.slice((page - 1) * limit, (page - 1) * limit + limit);
 
     res.status(200).json({
       success: true,
-      count: users.length,
+      count: paged.length,
       total,
       pagination: {
         page,
@@ -80,7 +79,7 @@ export const getUsers = async (req: Request, res: Response, next: NextFunction):
         totalPages: Math.ceil(total / limit) || 1,
         total,
       },
-      data: users,
+      data: paged.map(toPublicUser),
     });
   } catch (error) {
     next(error);
@@ -96,7 +95,7 @@ export const createUser = async (req: Request, res: Response, next: NextFunction
     const { name, email, password, role, phone, title, department } = req.body;
     const adminUser = req.user;
 
-    const existingUser = await User.findOne({ email: email.toLowerCase().trim() });
+    const existingUser = await findUserByEmail(email);
     if (existingUser) {
       res.status(409).json({
         success: false,
@@ -105,42 +104,39 @@ export const createUser = async (req: Request, res: Response, next: NextFunction
       return;
     }
 
-    const count = await User.countDocuments();
+    const count = await countUsers();
     const userId = `USR-${String(count + 1).padStart(3, '0')}`;
     const permissions = getDefaultPermissionsForRole(role as UserRole);
 
-    const newUser = new User({
+    const newUser = await createUserRecord({
       userId,
-      name: name.trim(),
-      email: email.toLowerCase().trim(),
-      passwordHash: password, // Pre-save hook hashes password using bcryptjs
-      role,
-      phone: phone || '',
-      title: title || '',
-      department: department || '',
+      name: String(name).trim(),
+      email: String(email),
+      password: String(password),
+      role: role as UserRole,
+      phone: phone ? String(phone).trim() : '',
+      title: title ? String(title).trim() : '',
+      department: department ? String(department).trim() : '',
       permissions,
-      isActive: true,
-      lastActive: 'Never',
     });
 
-    await newUser.save();
-
-    // Log server-side audit event for user creation
     await recordAuditEvent({
       userId: adminUser?.userId || 'USR-ADMIN',
       userName: adminUser?.name || 'Administrator',
       userRole: adminUser?.role || 'ADMIN',
       action: 'CREATE',
       module: 'USERS',
-      resourceId: userId,
-      description: `Created new ${role} staff user account for ${name} (${email})`,
+      resourceId: newUser.userId,
+      description: `Created staff user account ${newUser.userId} (${newUser.name}, role: ${newUser.role})`,
     });
+
+    const publicUser = toPublicUser(newUser);
 
     res.status(201).json({
       success: true,
-      message: `User account created successfully for ${name} (${role}).`,
-      user: newUser.toJSON(),
-      data: newUser.toJSON(),
+      message: `Staff user account ${newUser.userId} created successfully.`,
+      user: publicUser,
+      data: publicUser,
     });
   } catch (error) {
     next(error);
@@ -149,17 +145,14 @@ export const createUser = async (req: Request, res: Response, next: NextFunction
 
 /**
  * PUT /api/users/:id
- * Admin-only updating of staff user details, status, or role.
+ * Admin-only update of staff account role, profile fields and permissions.
  */
 export const updateUser = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id as string);
     const adminUser = req.user;
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const targetUser = await User.findOne({
-      $or: [{ userId: id }, { _id: isValidObjectId ? id : null }],
-    });
+    const targetUser = await findUserById(id);
 
     if (!targetUser) {
       res.status(404).json({
@@ -171,20 +164,22 @@ export const updateUser = async (req: Request, res: Response, next: NextFunction
 
     const { name, role, phone, title, department, isActive, permissions } = req.body;
 
-    if (name) targetUser.name = name.trim();
-    if (phone !== undefined) targetUser.phone = phone.trim();
-    if (title !== undefined) targetUser.title = title.trim();
-    if (department !== undefined) targetUser.department = department.trim();
-    if (isActive !== undefined) targetUser.isActive = Boolean(isActive);
+    const updates: Record<string, any> = {};
+
+    if (name) updates.name = String(name).trim();
+    if (phone !== undefined) updates.phone = String(phone).trim();
+    if (title !== undefined) updates.title = String(title).trim();
+    if (department !== undefined) updates.department = String(department).trim();
+    if (isActive !== undefined) updates.isActive = Boolean(isActive);
 
     if (role && ['ADMIN', 'DOCTOR', 'RECEPTION', 'RECEPTIONIST', 'THERAPIST'].includes(role)) {
-      targetUser.role = role as UserRole;
-      targetUser.permissions = permissions || getDefaultPermissionsForRole(role as UserRole);
+      updates.role = role as UserRole;
+      updates.permissions = permissions || getDefaultPermissionsForRole(role as UserRole);
     } else if (permissions) {
-      targetUser.permissions = { ...targetUser.permissions, ...permissions };
+      updates.permissions = { ...targetUser.permissions, ...permissions };
     }
 
-    await targetUser.save();
+    const updated = (await updateUserRecord(targetUser.userId, updates)) || { ...targetUser, ...updates };
 
     // Log server-side audit event for user update
     await recordAuditEvent({
@@ -193,15 +188,17 @@ export const updateUser = async (req: Request, res: Response, next: NextFunction
       userRole: adminUser?.role || 'ADMIN',
       action: 'UPDATE',
       module: 'USERS',
-      resourceId: targetUser.userId,
-      description: `Updated staff user account ${targetUser.userId} (${targetUser.name}, role: ${targetUser.role})`,
+      resourceId: updated.userId,
+      description: `Updated staff user account ${updated.userId} (${updated.name}, role: ${updated.role})`,
     });
+
+    const publicUser = toPublicUser(updated);
 
     res.status(200).json({
       success: true,
-      message: `User account ${targetUser.userId} updated successfully.`,
-      user: targetUser.toJSON(),
-      data: targetUser.toJSON(),
+      message: `User account ${updated.userId} updated successfully.`,
+      user: publicUser,
+      data: publicUser,
     });
   } catch (error) {
     next(error);
@@ -216,11 +213,8 @@ export const deleteUser = async (req: Request, res: Response, next: NextFunction
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id as string);
     const adminUser = req.user;
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(id);
 
-    const targetUser = await User.findOne({
-      $or: [{ userId: id }, { _id: isValidObjectId ? id : null }],
-    });
+    const targetUser = await findUserById(id);
 
     if (!targetUser) {
       res.status(404).json({
@@ -238,8 +232,7 @@ export const deleteUser = async (req: Request, res: Response, next: NextFunction
       return;
     }
 
-    targetUser.isActive = false;
-    await targetUser.save();
+    await updateUserRecord(targetUser.userId, { isActive: false });
 
     // Log server-side audit event for user deactivation
     await recordAuditEvent({

@@ -1,22 +1,25 @@
-import { NextResponse } from 'next/server';
-import dbConnect from '@/lib/dbConnect';
-import Consultation from '@/models/Consultation';
-import Patient from '@/models/Patient';
-import Prescription from '@/models/Prescription';
-import FollowUp from '@/models/FollowUp';
-import ClinicSettings from '@/models/ClinicSettings';
+﻿import { NextResponse } from 'next/server';
 import { ConsultationSchema } from '@/lib/validators';
 import { authorizeUser } from '@/lib/permissions';
+import { ensureDatabaseReady } from '@/lib/db';
+import { normalizeDatabaseError } from '@/lib/db/errors';
+import { listConsultations } from '@/lib/db/repositories/consultationRepository';
+import { createConsultationCascade } from '@/lib/db/repositories/consultationCascade';
+import { getPatientById } from '@/lib/db/repositories/patientRepository';
+import { getClinicSettings } from '@/lib/db/repositories/settingsRepository';
+import { auditFromSession } from '@/lib/audit';
+
+const RESTRICTED = '[Restricted: Clinical Note Access Limited for Reception]';
 
 // Helper to sanitize clinical notes for Reception role
 function sanitizeForReception(c: any) {
   return {
     ...c,
-    presentingComplaint: '[Restricted: Clinical Note Access Limited for Reception]',
-    clinicalObservations: '[Restricted: Clinical Note Access Limited for Reception]',
-    treatmentPlan: '[Restricted: Clinical Note Access Limited for Reception]',
-    notes: '[Restricted: Clinical Note Access Limited for Reception]',
-    followUpNotes: '[Restricted: Clinical Note Access Limited for Reception]',
+    presentingComplaint: RESTRICTED,
+    clinicalObservations: RESTRICTED,
+    treatmentPlan: RESTRICTED,
+    notes: RESTRICTED,
+    followUpNotes: RESTRICTED,
     mentalStatusExam: {
       appearance: '[Restricted]',
       behavior: '[Restricted]',
@@ -31,22 +34,27 @@ function sanitizeForReception(c: any) {
   };
 }
 
+function formatConsultation(consultation: any) {
+  return {
+    ...consultation,
+    id: consultation.consultationId,
+    date: consultation.consultationDate,
+  };
+}
+
 // GET /api/patients/[patientId]/consultations
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ patientId: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'RECEPTION', 'ADMIN', 'THERAPIST']);
+    const auth = await authorizeUser(['DOCTOR', 'RECEPTIONIST', 'RECEPTION', 'ADMIN', 'THERAPIST'], req);
     if (!auth.authorized) return auth.response!;
 
     const { patientId } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
 
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId }, { _id: isValidObjectId ? patientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       return NextResponse.json(
@@ -55,18 +63,11 @@ export async function GET(
       );
     }
 
-    const consultations = await Consultation.find({ patientId: patient.patientId })
-      .sort({ consultationDate: -1, createdAt: -1 })
-      .lean();
-
+    const consultations = await listConsultations({ patientId: patient.patientId });
     const isReception = auth.session?.role === 'RECEPTION' || auth.session?.role === 'RECEPTIONIST';
 
-    const formatted = consultations.map((c: any) => {
-      const item = {
-        ...c,
-        id: c.consultationId,
-        date: c.consultationDate,
-      };
+    const formatted = consultations.map((c) => {
+      const item = formatConsultation(c);
       return isReception ? sanitizeForReception(item) : item;
     });
 
@@ -77,10 +78,11 @@ export async function GET(
     });
   } catch (error: any) {
     console.error('Error fetching patient consultations:', error);
-    return NextResponse.json(
-      { success: false, error: 'Database error fetching patient consultation records.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Database error fetching patient consultation records.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }
 
@@ -90,11 +92,11 @@ export async function POST(
   { params }: { params: Promise<{ patientId: string }> }
 ) {
   try {
-    const auth = await authorizeUser(['DOCTOR', 'ADMIN']);
+    const auth = await authorizeUser(['DOCTOR', 'ADMIN'], req);
     if (!auth.authorized) return auth.response!;
 
     const { patientId } = await params;
-    await dbConnect();
+    await ensureDatabaseReady();
     const body = await req.json();
 
     body.patientId = patientId;
@@ -110,10 +112,7 @@ export async function POST(
 
     const consultData = validation.data;
 
-    const isValidObjectId = /^[0-9a-fA-F]{24}$/.test(patientId);
-    const patient = await Patient.findOne({
-      $or: [{ patientId }, { _id: isValidObjectId ? patientId : null }],
-    });
+    const patient = await getPatientById(patientId);
 
     if (!patient) {
       return NextResponse.json(
@@ -122,114 +121,59 @@ export async function POST(
       );
     }
 
-    const consultationDate = consultData.consultationDate || consultData.date || new Date().toISOString().split('T')[0];
-
-    const count = await Consultation.countDocuments();
-    let candidateNum = 5001 + count;
-    let consultationId = `CNS-${candidateNum}`;
-
-    while (await Consultation.exists({ consultationId })) {
-      candidateNum++;
-      consultationId = `CNS-${candidateNum}`;
-    }
-
     const doctorId = auth.session?.userId || consultData.doctorId || 'USR-001';
     const doctorName = auth.session?.name || consultData.doctorName || 'DR SHAHAB MUHAMMAD';
+    const settings = await getClinicSettings();
 
-    const newConsultation = new Consultation({
-      ...consultData,
-      consultationId,
-      patientId: patient.patientId,
-      patientName: patient.fullName,
-      doctorId,
-      doctorName,
-      clinicianId: doctorId,
-      clinicianName: doctorName,
-      consultationDate,
-    });
-
-    await newConsultation.save();
-
-    // Auto-create prescription if medications present
-    if (consultData.medications && consultData.medications.length > 0) {
-      const settings = await ClinicSettings.findOne();
-      const rxCount = await Prescription.countDocuments();
-      const prescriptionId = `RX-${900 + rxCount + 1}`;
-
-      const newRx = new Prescription({
-        prescriptionId,
+    const result = await createConsultationCascade({
+      consultation: {
+        ...consultData,
         patientId: patient.patientId,
         patientName: patient.fullName,
-        patientAge: patient.age,
-        patientGender: patient.gender,
         doctorId,
         doctorName,
-        doctorLicense: settings?.licenseNumber || 'NY-MED-849201',
-        prescriptionDate: consultationDate,
-        diagnosis: `${consultData.diagnosis.primaryTitle} (${consultData.diagnosis.primaryICD})`,
-        medications: consultData.medications,
-        treatmentPlan: consultData.treatmentPlan,
-        status: 'Active',
-      });
-
-      await newRx.save();
-    }
-
-    // Auto-create FollowUp record if specified
-    if (consultData.followUpDate) {
-      const flpCount = await FollowUp.countDocuments();
-      const followUpId = `FLP-${300 + flpCount + 1}`;
-
-      const todayStr = new Date().toISOString().split('T')[0];
-      let status: 'Due' | 'Upcoming' | 'Overdue' = 'Upcoming';
-      if (consultData.followUpDate === todayStr) status = 'Due';
-      else if (consultData.followUpDate < todayStr) status = 'Overdue';
-
-      const newFlp = new FollowUp({
-        followUpId,
+        clinicianId: doctorId,
+        clinicianName: doctorName,
+      },
+      patient: {
         patientId: patient.patientId,
-        patientName: patient.fullName,
+        fullName: patient.fullName,
+        age: patient.age,
+        gender: patient.gender,
         phone: patient.phone,
-        doctorId,
-        assignedDoctor: doctorName,
-        consultationId,
-        lastConsultationDate: consultationDate,
-        followUpDate: consultData.followUpDate,
-        reason: consultData.followUpNotes || `Clinical follow-up for ${consultData.diagnosis.primaryTitle}`,
-        priority: 'Routine',
-        status,
-        notes: consultData.followUpNotes || '',
-      });
+      },
+      doctorLicense: settings.licenseNumber,
+      actorId: auth.session?.userId || 'SYSTEM',
+    });
 
-      await newFlp.save();
-    }
-
-    // Update Patient lastVisitDate and nextFollowUpDate
-    patient.lastVisitDate = consultationDate;
-    if (consultData.followUpDate) {
-      patient.nextFollowUpDate = consultData.followUpDate;
-    }
-    await patient.save();
-
-    const formatted = {
-      ...newConsultation.toObject(),
-      id: newConsultation.consultationId,
-      date: newConsultation.consultationDate,
-    };
+    await auditFromSession(auth.session, {
+      action: 'CREATE',
+      module: 'CONSULTATIONS',
+      resourceType: 'CONSULTATION',
+      resourceId: result.consultation.consultationId,
+      patientRef: patient.patientId,
+      description: `Created consultation ${result.consultation.consultationId} for ${patient.fullName}`,
+      metadata: {
+        prescriptionId: result.prescription?.prescriptionId,
+        followUpId: result.followUp?.followUpId,
+        transactional: result.transactional,
+      },
+    });
 
     return NextResponse.json(
       {
         success: true,
-        data: formatted,
+        data: formatConsultation(result.consultation),
         message: `Clinical consultation record saved for ${patient.fullName}`,
       },
       { status: 201 }
     );
   } catch (error: any) {
     console.error('Error saving consultation:', error);
-    return NextResponse.json(
-      { success: false, error: 'Database error saving consultation record.' },
-      { status: 500 }
+    const { statusCode, message } = normalizeDatabaseError(
+      error,
+      'Database error saving consultation record.'
     );
+    return NextResponse.json({ success: false, error: message }, { status: statusCode });
   }
 }

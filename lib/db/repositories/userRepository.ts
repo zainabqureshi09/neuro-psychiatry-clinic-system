@@ -109,6 +109,22 @@ export async function findUserById(id: string): Promise<UserRecord | null> {
   };
 }
 
+/**
+ * Counts staff accounts without loading them (used for first-boot bootstrap).
+ */
+export async function countUsers(): Promise<number> {
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    const { count, error } = await supabase.from('users').select('*', { count: 'exact', head: true });
+    if (error) {
+      throw new Error(`Database error counting users: ${error.message}`);
+    }
+    return count || 0;
+  }
+
+  return User.countDocuments();
+}
+
 export async function listUsers(): Promise<UserRecord[]> {
   const supabase = getSupabaseClient();
   if (supabase) {
