@@ -76,13 +76,35 @@ function loadEnv(): void {
 async function main(): Promise<void> {
   loadEnv();
 
-  const connectionString = process.env.DATABASE_URL;
+  let connectionString = process.env.DATABASE_URL;
+
+  // Convenience fallback: if DATABASE_URL is absent, build the session-pooler
+  // string from three simple values. This removes any need to hand-assemble a
+  // URL or percent-encode a password. The values stay in the git-ignored
+  // .env.local and are never printed.
+  if (!connectionString) {
+    const host = process.env.SUPABASE_DB_HOST;
+    const user = process.env.SUPABASE_DB_USER;
+    const password = process.env.SUPABASE_DB_PASSWORD;
+
+    if (host && user && password) {
+      connectionString =
+        `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}` +
+        `@${host}:5432/postgres?sslmode=require`;
+      console.log('Using SUPABASE_DB_* values to build the session-pooler connection string.\n');
+    }
+  }
+
   if (!connectionString) {
     console.error(
-      'DATABASE_URL is not set.\n' +
-        'Add the Supabase SESSION pooler string to .env.local first, e.g.\n' +
-        '  DATABASE_URL="postgresql://postgres.<ref>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"\n' +
-        'Use the session pooler (port 5432), not the transaction pooler (6543), so BEGIN/COMMIT stay on one backend.'
+      'No database credentials found.\n\n' +
+        'Easiest option — add these three lines to .env.local:\n' +
+        '  SUPABASE_DB_HOST=aws-0-<region>.pooler.supabase.com\n' +
+        '  SUPABASE_DB_USER=postgres.<project-ref>\n' +
+        '  SUPABASE_DB_PASSWORD=<your database password>\n\n' +
+        'Or provide the full string:\n' +
+        '  DATABASE_URL="postgresql://postgres.<ref>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"\n\n' +
+        'Use the SESSION pooler (port 5432), not the transaction pooler (6543), so BEGIN/COMMIT stay on one backend.'
     );
     process.exit(1);
   }
