@@ -94,9 +94,35 @@ holding that key could read/write every patient, consultation, prescription and 
 while bypassing the app's JWT + RBAC. The server is unaffected by the fix because the
 secret key maps to `service_role`, which bypasses RLS.
 
+### Phase S — Supabase provisioning 🔄
+
+| Check | Result |
+|---|---|
+| Project host created | ✅ Resolves (2 A records via local resolver **and** Google DoH) |
+| Project live | ✅ `GET /auth/v1/health` → **HTTP 200** |
+| Publishable key valid | ✅ Accepted by PostgREST (otherwise HTTP 401) |
+| `public` schema state | ✅ **Empty** — `GET /rest/v1/patients` → `PGRST205` "Could not find the table" |
+| Migrations applied | ⛔ None yet (by design) |
+| Secret key installed | ⛔ Pending (must never be shared in chat) |
+
+The old host `<old-project-ref>.supabase.co` remains dead; the new project replaces it.
+Access values live only in the git-ignored `.env.local`.
+
+**Ordering rule (safety-critical):** File 1 creates 13 tables *without* RLS. Until File 2
+runs, those tables are readable through the public REST API by anyone holding the
+publishable key. Both files must be applied back-to-back, and **no real patient data may be
+loaded before File 2 completes.**
+
+**Configuration trap:** the provider switches to PostgreSQL as soon as `SUPABASE_URL` and a
+format-valid `SUPABASE_SECRET_KEY` are both present. If the new URL is paired with the *old*
+project's secret key, the app will attempt every request against the new project using a
+foreign key and fail with 401. The URL and the secret key must always be replaced in the
+same edit.
+
 ---
 
 ## 5. Change log
+
 
 | Commit | Tag | Summary |
 |---|---|---|
@@ -152,9 +178,10 @@ Includes pre-check and post-check queries plus a commented rollback block.
 
 | # | Item | Owner | Blocked by |
 |---|---|---|---|
-| P1 | Create the new Supabase project | Owner | — |
-| P2 | Apply File 1 then File 2 in the SQL Editor | Owner | P1 |
-| P3 | Store project URL + keys in `.env.local` (never in chat/git) | Owner | P1 |
+| P1 | Create the new Supabase project | Owner | ✅ Done 2026-11-03 (live, schema empty) |
+| P2 | Apply File 1 then File 2 in the SQL Editor | Owner | P1 ✅ — ready |
+| P3 | Store project URL + keys in `.env.local` (never in chat/git) | Owner | P1 ✅ — ready |
+| P3a | Install the new project's **secret key** into `.env.local` (replaces the dead project's key) | Owner | must be done in the same edit as P3 |
 | P4 | Confirm production domain + SSH access | Owner | — |
 | P5 | Decide authoritative API surface (Nginx sends all `/api/` to Express; 27 Next handlers become dead in prod) | Owner | — |
 | P6 | Remove `app/supabase-test/page.tsx` + unused `utils/supabase/*` helpers | Needs owner OK | — |
