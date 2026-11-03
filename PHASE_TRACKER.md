@@ -111,6 +111,7 @@ secret key maps to `service_role`, which bypasses RLS.
 | `public` schema state | ✅ **Empty** — `GET /rest/v1/patients` → `PGRST205` "Could not find the table" |
 | Migrations applied | ⛔ None yet — re-verified 2026-11-03 via REST probe (`patients` and `clinic_settings` both `PGRST205`) |
 | Secret key installed | ⛔ Pending (must never be shared in chat) |
+| Direct DB connection `db.<ref>:5432` | ⚠️ **IPv6-only** (AAAA `2406:da1c:…`, **no** IPv4 A record). The dev PC holds no global IPv6 address, so TCP 5432 is unreachable from here. Use the **Session pooler** (IPv4) for `DATABASE_URL`. |
 
 The old host `<old-project-ref>.supabase.co` remains dead; the new project replaces it.
 Access values live only in the git-ignored `.env.local`.
