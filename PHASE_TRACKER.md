@@ -112,6 +112,8 @@ secret key maps to `service_role`, which bypasses RLS.
 | Migrations applied | ⛔ None yet — re-verified 2026-11-03 via REST probe (`patients` and `clinic_settings` both `PGRST205`) |
 | Secret key installed | ⛔ Pending (must never be shared in chat) |
 | Direct DB connection `db.<ref>:5432` | ⚠️ **IPv6-only** (AAAA `2406:da1c:…`, **no** IPv4 A record). The dev PC holds no global IPv6 address, so TCP 5432 is unreachable from here. Use the **Session pooler** (IPv4) for `DATABASE_URL`. |
+| Session pooler `aws-0-<region>.pooler.supabase.com` | ✅ IPv4 (<pooler-ip-1> · <pooler-ip-2> · <pooler-ip-3>). TCP **5432 reachable**, TCP 6543 reachable |
+| Project region | **ap-southeast-2 (Sydney)** — permanent after creation; factor into latency when sizing the VPS |
 
 The old host `<old-project-ref>.supabase.co` remains dead; the new project replaces it.
 Access values live only in the git-ignored `.env.local`.
@@ -197,7 +199,8 @@ Includes pre-check and post-check queries plus a commented rollback block.
 | P4 | Confirm production domain + SSH access | Owner | — |
 | P5 | Decide authoritative API surface (Nginx sends all `/api/` to Express; 27 Next handlers become dead in prod) | Owner | — |
 | P6 | Remove `app/supabase-test/page.tsx` + unused `utils/supabase/*` helpers | Needs owner OK | — |
-| P7 | `DATABASE_URL` (Session pooler) for atomic payments/booking/cascades | Agent | P3 |
+| P7 | `DATABASE_URL` (session pooler **5432**, `?sslmode=require`) for atomic payments/booking/cascades — **never** the transaction pooler 6543, which breaks BEGIN/COMMIT | Agent | P3 |
+| P7a | `npm run apply:supabase` migration runner created (`scripts/applySupabaseMigrations.ts`) — dry-run by default, `--apply` to write, verifies RLS afterwards | Agent | ✅ Tool ready (untested against live DB) |
 | P8 | Rewrite `.env.production.example` as Supabase-first | Agent | P3 |
 | P9 | Read-only MongoDB → PostgreSQL migration tool | Agent | Phase 4 |
 | P10 | Supabase backup/PITR runbook + `pg_dump` cron | Agent | VPS approval |

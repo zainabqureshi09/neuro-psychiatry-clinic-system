@@ -10,7 +10,8 @@
     "backend": "tsx backend/server.ts",
     "test:backend": "tsx scripts/testAuth.ts",
     "test:postgres": "tsx scripts/testPhase14PostgresMigration.ts",
-    "validate:schema": "tsx scripts/validateSchema.ts"
+    "validate:schema": "tsx scripts/validateSchema.ts",
+    "apply:supabase": "tsx scripts/applySupabaseMigrations.ts"
   },
   "dependencies": {
     "@supabase/server": "^1.9.2",
