@@ -211,7 +211,8 @@ Includes pre-check and post-check queries plus a commented rollback block.
 |---|---|---|---|
 | P1 | Create the new Supabase project | Owner | ✅ Done 2026-11-03 (live, schema empty) |
 | P2 | Apply File 1 then File 2 in the SQL Editor | Owner | ✅ Done 2026-11-04 (applied by agent via runner) |
-| P3 | Point `SUPABASE_URL` / `SUPABASE_SECRET_KEY` / `NEXT_PUBLIC_*` at the new project — **`.env.local` still contains the dead project's values** | Owner | ⛔ **Blocking Phase 2** |
+| P3 | Point `SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_*` / `SUPABASE_JWKS_URL` at the new project | Agent | ✅ Done 2026-11-04 |
+| P3b | Replace the `SUPABASE_SECRET_KEY` placeholder (`sb_secret_your_secret_key_replace_me`) with the real secret key | Owner | ⛔ **Only remaining blocker for Phase 2** |
 | P3a | Install the new project's **secret key** into `.env.local` (replaces the dead project's key) | Owner | must be done in the same edit as P3 |
 | P4 | Confirm production domain + SSH access | Owner | — |
 | P5 | Decide authoritative API surface (Nginx sends all `/api/` to Express; 27 Next handlers become dead in prod) | Owner | — |
