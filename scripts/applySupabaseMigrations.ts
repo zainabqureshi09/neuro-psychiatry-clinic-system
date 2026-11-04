@@ -174,7 +174,17 @@ async function main(): Promise<void> {
 
       console.log(`APPLYING   ${migration.label}`);
       try {
-        await client.query(sql);
+        // File 1 has no BEGIN/COMMIT. Wrapping it makes the DDL atomic: either
+        // all 13 tables are created or none are, so a mid-way failure can never
+        // leave a half-built schema. File 2 already manages its own transaction.
+        const managesOwnTransaction = /^\s*BEGIN\s*;/im.test(sql);
+        const payload = managesOwnTransaction ? sql : `BEGIN;\n${sql}\nCOMMIT;`;
+
+        if (!managesOwnTransaction) {
+          console.log('           wrapped in BEGIN/COMMIT for atomicity');
+        }
+
+        await client.query(payload);
         console.log('           OK\n');
       } catch (error: any) {
         console.error(`           FAILED: ${error?.message || error}`);
