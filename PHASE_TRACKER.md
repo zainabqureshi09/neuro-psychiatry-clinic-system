@@ -111,6 +111,8 @@ secret key maps to `service_role`, which bypasses RLS.
 | `public` schema state | ✅ **Empty** — `GET /rest/v1/patients` → `PGRST205` "Could not find the table" |
 | Migrations applied | ⛔ None yet — re-verified 2026-11-03 via REST probe (`patients` and `clinic_settings` both `PGRST205`) |
 | Secret key installed | ⛔ Pending (must never be shared in chat) |
+| DB credentials verified | ✅ 2026-11-04 — session pooler accepted; `db=postgres user=postgres`; **PostgreSQL 17.11** (aarch64) |
+| TLS note | Supabase pooler cert is signed by a CA Node does not trust → `sslmode=require` fails with "self-signed certificate in certificate chain". The migration runner uses `sslmode=no-verify` (still TLS-encrypted). Production should install the project CA and use `verify-full`. |
 | Direct DB connection `db.<ref>:5432` | ⚠️ **IPv6-only** (AAAA `2406:da1c:…`, **no** IPv4 A record). The dev PC holds no global IPv6 address, so TCP 5432 is unreachable from here. Use the **Session pooler** (IPv4) for `DATABASE_URL`. |
 | Session pooler `aws-0-<region>.pooler.supabase.com` | ✅ IPv4 (<pooler-ip-1> · <pooler-ip-2> · <pooler-ip-3>). TCP **5432 reachable**, TCP 6543 reachable |
 | Project region | **ap-southeast-2 (Sydney)** — permanent after creation; factor into latency when sizing the VPS |

@@ -88,9 +88,14 @@ async function main(): Promise<void> {
     const password = process.env.SUPABASE_DB_PASSWORD;
 
     if (host && user && password) {
+      // sslmode=no-verify: encrypt the connection WITHOUT validating the CA
+      // chain. Supabase's pooler certificate is signed by a CA that Node does
+      // not ship, so `sslmode=require` is upgraded to `verify-full` by
+      // pg-connection-string and fails with "self-signed certificate in
+      // certificate chain". Traffic is still TLS-encrypted.
       connectionString =
         `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}` +
-        `@${host}:5432/postgres?sslmode=require`;
+        `@${host}:5432/postgres?sslmode=no-verify`;
       console.log('Using SUPABASE_DB_* values to build the session-pooler connection string.\n');
     }
   }
@@ -203,7 +208,7 @@ async function main(): Promise<void> {
       console.log('RESULT: all 13 tables exist and have RLS enabled.');
     } else if (!APPLY) {
       console.log(
-        `RESULT (dry run): ${13 - rls.rows.length} table(s) do not exist yet — nothing was written.`
+        `RESULT (dry run): ${13 - rls.rows.length} table(s) do not exist yet - nothing was written.`
       );
     } else {
       console.log(
@@ -220,7 +225,28 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  console.error('FATAL:', error?.message || error);
+  const message = error?.message || String(error);
+  console.error('FATAL:', message);
+
+  if (/self-signed certificate|unable to verify the first certificate|CERT/i.test(message)) {
+    console.error(
+      '\nTLS trust failure (not a password problem).\n' +
+        'Supabase signs the pooler certificate with its own CA. Either:\n' +
+        '  - append &sslmode=no-verify to your DATABASE_URL, or\n' +
+        '  - download the project CA and use sslmode=verify-full with sslrootcert.\n'
+    );
+  } else if (/password authentication failed|SASL|28P01/i.test(message)) {
+    console.error(
+      '\nAuthentication failed - the database password does not match.\n' +
+        'Reset it in Supabase: Project Settings -> Database -> Reset database password.\n' +
+        'Then update SUPABASE_DB_PASSWORD in .env.local.\n'
+    );
+  } else if (/ENOTFOUND|EAI_AGAIN/i.test(message)) {
+    console.error('\nHost could not be resolved — check SUPABASE_DB_HOST.\n');
+  } else if (/ETIMEDOUT|timeout|ECONNREFUSED/i.test(message)) {
+    console.error('\nCould not reach the host on port 5432 - check network/firewall and that you used the session pooler.\n');
+  }
+
   process.exit(1);
 });
 
