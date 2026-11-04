@@ -48,8 +48,8 @@ the real Supabase project.
 |---|---|---|
 | **0** | Audit, source backup, Git checkpoint | ✅ **Complete** |
 | **1** | Schema security hardening (RLS, grants, FK integrity) + production secret guard | ✅ **Complete** |
-| **S** | Provision a new Supabase project and connect it | 🔄 **In progress** |
-| **2** | Connect app to Supabase, validate credentials, transactional pool, env templates | ⏳ Blocked by Phase S |
+| **S** | Provision + migrate the new Supabase project | ✅ **Complete** (2026-11-04) |
+| **2** | Connect app to Supabase, validate credentials, transactional pool, env templates | 🔄 **Next** — blocked by P3 |
 | **3** | Read-only MongoDB → PostgreSQL data migration (MongoDB preserved) | ⏳ Not started (needs approval) |
 | **4** | Live integration tests against real Supabase | ⏳ Not started |
 | **5** | VPS deployment (PM2, Nginx, Certbot, UFW, pg_dump backups) | ⛔ **Not approved** |
@@ -109,7 +109,22 @@ secret key maps to `service_role`, which bypasses RLS.
 | Project live | ✅ `GET /auth/v1/health` → **HTTP 200** |
 | Publishable key valid | ✅ Accepted by PostgREST (otherwise HTTP 401) |
 | `public` schema state | ✅ **Empty** — `GET /rest/v1/patients` → `PGRST205` "Could not find the table" |
-| Migrations applied | ⛔ None yet — re-verified 2026-11-03 via REST probe (`patients` and `clinic_settings` both `PGRST205`) |
+| Migrations applied | ✅ **Done 2026-11-04** — File 1 + File 2 applied via `npm run apply:supabase -- --apply` (exit 0) |
+
+**Post-migration verification (independent queries, not the runner's own report):**
+
+| Check | Result |
+|---|---|
+| Tables | **13 / 13** |
+| Indexes (incl. PK/UNIQUE) | 60 — 34 explicit `CREATE INDEX` + PK/unique constraints |
+| Triggers | 18 catalog rows for 15 trigger objects |
+| Functions | 5 |
+| RLS enabled | **13 / 13** |
+| `clinic_settings` seed | 1 row → *Neuro Psychiatry Clinic / DR SHAHAB MUHAMMAD* |
+| FK `ON DELETE` | 11 × `RESTRICT`, 1 × `SET NULL` (payments→fee_categories). The 3 former `CASCADE` rules are now `RESTRICT` |
+| `anon` / `authenticated` grants | `SELECT=false`, `INSERT=false` on every table |
+| REST probe (publishable key) | `patients`, `payments`, `users` → **HTTP 401 · code `42501` (insufficient_privilege)** |
+
 | Secret key installed | ⛔ Pending (must never be shared in chat) |
 | DB credentials verified | ✅ 2026-11-04 — session pooler accepted; `db=postgres user=postgres`; **PostgreSQL 17.11** (aarch64) |
 | TLS note | Supabase pooler cert is signed by a CA Node does not trust → `sslmode=require` fails with "self-signed certificate in certificate chain". The migration runner uses `sslmode=no-verify` (still TLS-encrypted). Production should install the project CA and use `verify-full`. |
@@ -195,8 +210,8 @@ Includes pre-check and post-check queries plus a commented rollback block.
 | # | Item | Owner | Blocked by |
 |---|---|---|---|
 | P1 | Create the new Supabase project | Owner | ✅ Done 2026-11-03 (live, schema empty) |
-| P2 | Apply File 1 then File 2 in the SQL Editor | Owner | P1 ✅ — ready |
-| P3 | Store project URL + keys in `.env.local` (never in chat/git) | Owner | P1 ✅ — ready |
+| P2 | Apply File 1 then File 2 in the SQL Editor | Owner | ✅ Done 2026-11-04 (applied by agent via runner) |
+| P3 | Point `SUPABASE_URL` / `SUPABASE_SECRET_KEY` / `NEXT_PUBLIC_*` at the new project — **`.env.local` still contains the dead project's values** | Owner | ⛔ **Blocking Phase 2** |
 | P3a | Install the new project's **secret key** into `.env.local` (replaces the dead project's key) | Owner | must be done in the same edit as P3 |
 | P4 | Confirm production domain + SSH access | Owner | — |
 | P5 | Decide authoritative API surface (Nginx sends all `/api/` to Express; 27 Next handlers become dead in prod) | Owner | — |
