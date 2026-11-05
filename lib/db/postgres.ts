@@ -21,12 +21,21 @@ export function getPostgresPool(): Pool | null {
   }
 
   try {
+    // Managed providers (Supabase included) require TLS on every connection.
+    // The previous NODE_ENV-based check meant development connections were made
+    // WITHOUT TLS and rejected by the server. TLS is now enabled whenever the
+    // target is not a local host.
+    const isLocalHost = /localhost|127\.0\.0\.1|::1/.test(dbUrl);
+
     pool = new Pool({
       connectionString: dbUrl,
       max: 10,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 5000,
-      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
+      // Encrypt without pinning the provider CA (Node does not ship Supabase's
+      // certificate chain). Traffic is still TLS. For maximum assurance, supply
+      // the project CA and use sslmode=verify-full.
+      ssl: isLocalHost ? undefined : { rejectUnauthorized: false },
     });
 
     pool.on('error', (err) => {

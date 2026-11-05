@@ -49,7 +49,9 @@ the real Supabase project.
 | **0** | Audit, source backup, Git checkpoint | ✅ **Complete** |
 | **1** | Schema security hardening (RLS, grants, FK integrity) + production secret guard | ✅ **Complete** |
 | **S** | Provision + migrate the new Supabase project | ✅ **Complete** (2026-11-04) |
-| **2** | Connect app to Supabase, validate credentials, transactional pool, env templates | 🔄 **Next** — blocked by P3 |
+| **2** | Connect app to Supabase, validate credentials, transactional pool, env templates | ✅ **Complete** (2026-11-04) |
+| **3** | Read-only MongoDB → PostgreSQL data migration (MongoDB preserved) | ⏳ Awaiting owner approval |
+| **4** | Live integration tests against real Supabase | ✅ Covered by Phase 2 suite (34/34) — extend in Phase 4 |
 | **3** | Read-only MongoDB → PostgreSQL data migration (MongoDB preserved) | ⏳ Not started (needs approval) |
 | **4** | Live integration tests against real Supabase | ⏳ Not started |
 | **5** | VPS deployment (PM2, Nginx, Certbot, UFW, pg_dump backups) | ⛔ **Not approved** |
@@ -149,6 +151,39 @@ format-valid `SUPABASE_SECRET_KEY` are both present. If the new URL is paired wi
 project's secret key, the app will attempt every request against the new project using a
 foreign key and fail with 401. The URL and the secret key must always be replaced in the
 same edit.
+### Phase 2 — Live connection & integration ✅
+
+Executed by `npm run test:phase2` (`scripts/testPhase2Live.ts`), which writes
+`scratch/phase2-report.txt`. **Result: 34 passed, 0 failed, 0 skipped.**
+
+| Area | Checks | Result |
+|---|---|---|
+| A. Credentials | URL, format check, secret key accepted by PostgREST | 4/4 |
+| B. Provider | `provider === 'postgres'`; `ensureDatabaseReady()` | 2/2 |
+| C. Pooler | `DATABASE_URL` set, pool created, `SELECT 1`, server version | 4/4 |
+| D. Transactions | COMMIT persists, ROLLBACK discards, rollback restores an UPDATE | 3/3 |
+| E. Auth | bcrypt hash, accept/reject password, JWT sign+verify, expired token, `getSession`, RBAC allow + 403 | 10/10 |
+| F. CRUD | patient create/search/duplicate, consultation cascade (**transactional=true**), payment + immutable-receipt trigger, audit write, settings, soft delete | 10/10 |
+| G. Cleanup | only this run's rows removed; every table back to 0 | 1/1 |
+
+**Fixes required to make this work**
+
+* `lib/db/postgres.ts` — TLS was enabled only when `NODE_ENV === 'production'`, so development
+  connections reached Supabase without TLS and were rejected. TLS is now enabled for any
+  non-local host.
+* `DATABASE_URL` added to `.env.local` (session pooler, port **5432**, `?sslmode=no-verify`).
+  Port **6543 must never be used** — transaction pooling breaks `BEGIN/COMMIT`.
+* New tooling: `npm run verify:supabase`, `npm run test:phase2`.
+
+**Verified live facts**
+
+* PostgreSQL **17.11** (aarch64) via `aws-0-<region>.pooler.supabase.com:5432`
+* Secret key acts as `service_role` (PostgREST HTTP 200); publishable key denied (`42501`)
+* Receipt-number immutability enforced by the database trigger, not only by application code
+* Note: an early PowerShell probe falsely reported 401 — PS 5.1 header handling. Node `fetch`
+  (the path the app actually uses) returns 200.
+
+
 
 ---
 
@@ -212,12 +247,12 @@ Includes pre-check and post-check queries plus a commented rollback block.
 | P1 | Create the new Supabase project | Owner | ✅ Done 2026-11-03 (live, schema empty) |
 | P2 | Apply File 1 then File 2 in the SQL Editor | Owner | ✅ Done 2026-11-04 (applied by agent via runner) |
 | P3 | Point `SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_*` / `SUPABASE_JWKS_URL` at the new project | Agent | ✅ Done 2026-11-04 |
-| P3b | Replace the `SUPABASE_SECRET_KEY` placeholder (`sb_secret_your_secret_key_replace_me`) with the real secret key | Owner | ⛔ **Only remaining blocker for Phase 2** |
+| P3b | Replace the `SUPABASE_SECRET_KEY` placeholder with the real secret key | Owner | ✅ Done 2026-11-04 (verified: service_role, HTTP 200) |
 | P3a | Install the new project's **secret key** into `.env.local` (replaces the dead project's key) | Owner | must be done in the same edit as P3 |
 | P4 | Confirm production domain + SSH access | Owner | — |
 | P5 | Decide authoritative API surface (Nginx sends all `/api/` to Express; 27 Next handlers become dead in prod) | Owner | — |
 | P6 | Remove `app/supabase-test/page.tsx` + unused `utils/supabase/*` helpers | Needs owner OK | — |
-| P7 | `DATABASE_URL` (session pooler **5432**, `?sslmode=require`) for atomic payments/booking/cascades — **never** the transaction pooler 6543, which breaks BEGIN/COMMIT | Agent | P3 |
+| P7 | `DATABASE_URL` (session pooler **5432**, `?sslmode=require`) for atomic payments/booking/cascades — **never** the transaction pooler 6543, which breaks BEGIN/COMMIT | Agent | ✅ Done 2026-11-04 |
 | P7a | `npm run apply:supabase` migration runner created (`scripts/applySupabaseMigrations.ts`) — dry-run by default, `--apply` to write, verifies RLS afterwards | Agent | ✅ Tool ready (untested against live DB) |
 | P8 | Rewrite `.env.production.example` as Supabase-first | Agent | P3 |
 | P9 | Read-only MongoDB → PostgreSQL migration tool | Agent | Phase 4 |
