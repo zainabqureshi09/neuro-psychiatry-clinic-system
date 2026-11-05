@@ -225,8 +225,58 @@ rows must wait for them to land (2s settle added) — otherwise rows arrive afte
 
 ---
 
-## 5. Change log
+### Phase 4 — Browser E2E: preparation status 🔄
 
+**Playwright availability (checked 2026-11-05): NOT INSTALLED.**
+```
+node_modules/playwright        -> False
+node_modules/@playwright/test  -> False
+playwright-core                -> False
+global `playwright` command    -> False
+%LOCALAPPDATA%\ms-playwright   -> False
+package.json mentions          -> False
+Node v24.18.1 / npm 12.0.2
+```
+**⚠️ Disk: only 2.6 GB free on C:** — Chromium-only install (~500 MB total) is advised;
+full browser set (~1.2 GB+) is not.
+
+#### Ready now (built and verified this session)
+`scripts/e2eFixtures.ts` + `npm run e2e:fixtures` / `npm run e2e:cleanup`
+
+| Property | Implementation |
+|---|---|
+| Test accounts | 4 synthetic staff: `e2e.admin@npcs.test`, `e2e.doctor@npcs.test`, `e2e.therapist@npcs.test`, `e2e.reception@npcs.test` |
+| Domain safety | `.test` is an RFC 2606 reserved TLD — can never reach a real mailbox |
+| Synthetic patient | `E2E SYNTHETIC PATIENT`, phone `03000000001`, created only via the fixture script |
+| Production admin | ❌ **never created** — bootstrap path not used |
+| Cleanup | deletes only `@npcs.test` users, `E2E SYNTHETIC%` patients, their clinical rows and audit entries |
+| MongoDB | ❌ never touched |
+| Verified this session | seed → 4 users + 1 patient (`PX-9401`); cleanup → **0 users / 0 patients** |
+
+#### Planned test matrix (to author once Playwright is approved)
+
+| # | Scenario | Approach |
+|---|---|---|
+| 1 | Login (valid) | `/` → `input[type=email]` + `input[type=password]` → `button[type=submit]` → assert login form detached + `localStorage.psychiatrist_token` set |
+| 2 | Login (invalid) | expect an error state and **no** session token |
+| 3 | Session persistence | new context with stored cookie/localStorage reloads → still authenticated |
+| 4 | Logout | session token + `psychiatrist_session` cookie cleared; protected view replaced by login |
+| 5 | Role-based access | RECEPTION / THERAPIST sessions must not reach ADMIN-only screens (`/users`, `/settings` write) |
+| 6 | Patient search | global search returns the synthetic patient only |
+| 7 | Patient creation | `/patients/new` → creates `E2E SYNTHETIC …`; duplicate phone must be refused |
+| 8 | Reports | `/reports` renders live aggregates from `GET /api/reports` (not placeholder numbers) |
+
+**Selectors:** the login screen exposes stable `type="email"` / `type="password"` / `type="submit"`
+attributes, so **no UI changes and no `data-testid` attributes are required** — satisfying the
+"preserve the existing UI" constraint.
+
+**Why specs are not written yet:** authoring browser selectors without a running browser produces
+tests that cannot be trusted. Once Playwright is approved I will author each spec *against the live
+app*, run it, and fix selectors until green — so every spec handed over has actually executed.
+
+---
+
+## 5. Change log
 
 | Commit | Tag | Summary |
 |---|---|---|
