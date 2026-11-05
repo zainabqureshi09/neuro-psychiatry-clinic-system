@@ -46,7 +46,18 @@ export const GlobalSearchModal: React.FC = () => {
       return;
     }
     let active = true;
-    fetch(`/api/patients?q=${encodeURIComponent(debouncedQuery)}`)
+    // All API traffic goes to the Express backend (single authoritative API).
+    // Relative /api calls would hit Next.js route handlers, which are frozen and
+    // non-authoritative in production (Nginx routes /api/ to Express).
+    const BACKEND_API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+    const token = typeof window !== 'undefined' ? localStorage.getItem('psychiatrist_token') : null;
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    fetch(`${BACKEND_API}/api/patients?q=${encodeURIComponent(debouncedQuery)}`, {
+      headers,
+      credentials: 'include',
+    })
       .then(res => res.json())
       .then(json => {
         if (active && json.success) {

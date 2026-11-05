@@ -10,6 +10,7 @@ import {
   getPaymentReceipt,
   getDailyCollectionReport,
   getMonthlyCollectionReport,
+  getPracticeReports,
 } from "../controllers/billingController";
 import { authenticate, requireRole } from "../middleware/authMiddleware";
 import { validateRequest } from "../middleware/validationMiddleware";
@@ -83,6 +84,12 @@ paymentRouter.put(
 export const reportRouter = Router();
 reportRouter.use(authenticate);
 
+// GET /api/reports - practice analytics (ADMIN + DOCTOR, mirrors the Next.js handler)
+reportRouter.get(
+  "/",
+  requireRole("ADMIN", "DOCTOR"),
+  getPracticeReports
+);
 reportRouter.get(
   "/collections/daily",
   requireRole("ADMIN", "DOCTOR", "RECEPTION"),

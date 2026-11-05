@@ -50,6 +50,7 @@ the real Supabase project.
 | **1** | Schema security hardening (RLS, grants, FK integrity) + production secret guard | ✅ **Complete** |
 | **S** | Provision + migrate the new Supabase project | ✅ **Complete** (2026-11-04) |
 | **2** | Connect app to Supabase, validate credentials, transactional pool, env templates | ✅ **Complete** (2026-11-04) |
+| **2b** | Express declared single authoritative API; dead Supabase scaffolding removed | ✅ **Complete** (2026-11-05) |
 | **3** | Read-only MongoDB → PostgreSQL data migration (MongoDB preserved) | ⏳ Awaiting owner approval |
 | **4** | Live integration tests against real Supabase | ✅ Covered by Phase 2 suite (34/34) — extend in Phase 4 |
 | **3** | Read-only MongoDB → PostgreSQL data migration (MongoDB preserved) | ⏳ Not started (needs approval) |
@@ -187,6 +188,43 @@ Executed by `npm run test:phase2` (`scripts/testPhase2Live.ts`), which writes
 
 ---
 
+### Phase 2b — Express as the single authoritative API ✅ (2026-11-05)
+
+**Owner decision:** Express is authoritative. Next.js API handlers are **frozen** as
+non-authoritative regression references (39 offline tests exercise them) and are **not deleted**.
+
+**Removed (owner-approved Option 1, after checkpoint tag `pre-express-authority`):**
+* `app/supabase-test/page.tsx` — public unauthenticated page querying a non-existent `todos` table
+* `utils/supabase/client.ts`, `utils/supabase/server.ts`, `utils/supabase/middleware.ts` — orphaned
+  helpers imported by nothing else
+
+**Gap found and fixed:** Express had **no `GET /api/reports`** — only `/collections/daily` and
+`/collections/monthly`. Behind Nginx, `ReportsScreen` would have silently fallen back to placeholder
+numbers. Added `getPracticeReports` (billingController) + route with the same `ADMIN`/`DOCTOR` gate,
+backed by the same `getPracticeReport()` repository as the frozen Next handler.
+
+**Frontend calls repointed to Express** (matching the existing `PatientListScreen` pattern —
+Bearer token + `credentials: 'include'`):
+* `components/common/GlobalSearchModal.tsx` → `${NEXT_PUBLIC_API_URL}/api/patients?q=`
+* `components/screens/ReportsScreen.tsx` → `${NEXT_PUBLIC_API_URL}/api/reports`
+
+**Live Express verification:** `npm run test:express` → **24/24 passed**
+(report: `scratch/express-report.txt`). Confirms health, security headers, 401 unauthenticated,
+`/api/patients?q=` (GlobalSearchModal), paginated list, `/api/reports` (ReportsScreen),
+`/api/reports/collections/daily`, `/api/settings`, `/api/audit-logs`, 403 for a real THERAPIST,
+CORS preflight with credentials for `localhost:3000`, login 401/200, httpOnly cookie.
+
+**Two security findings surfaced while testing (both positive):**
+1. `authenticate` resolves the user's role **from the database**, not the JWT claim — a forged
+   `role` in a token cannot escalate privileges.
+2. `validateRequest` rejects a malformed login payload with **400** before credential checking
+   (correct: invalid input ≠ invalid credentials).
+
+**Regression warning recorded:** audit writes are fire-and-forget, so any test that deletes audit
+rows must wait for them to land (2s settle added) — otherwise rows arrive after the DELETE.
+
+---
+
 ## 5. Change log
 
 
@@ -250,7 +288,8 @@ Includes pre-check and post-check queries plus a commented rollback block.
 | P3b | Replace the `SUPABASE_SECRET_KEY` placeholder with the real secret key | Owner | ✅ Done 2026-11-04 (verified: service_role, HTTP 200) |
 | P3a | Install the new project's **secret key** into `.env.local` (replaces the dead project's key) | Owner | must be done in the same edit as P3 |
 | P4 | Confirm production domain + SSH access | Owner | — |
-| P5 | Decide authoritative API surface (Nginx sends all `/api/` to Express; 27 Next handlers become dead in prod) | Owner | — |
+| P5 | Decide authoritative API surface (Nginx sends all `/api/` to Express; 27 Next handlers become dead in prod) | Owner | ✅ **Decided 2026-11-05: Express is authoritative.** Next handlers frozen, not deleted |
+| P6 | Remove `app/supabase-test/page.tsx` + unused `utils/supabase/*` helpers | Agent | ✅ **Done 2026-11-05** (Option 1 approved) |
 | P6 | Remove `app/supabase-test/page.tsx` + unused `utils/supabase/*` helpers | Needs owner OK | — |
 | P7 | `DATABASE_URL` (session pooler **5432**, `?sslmode=require`) for atomic payments/booking/cascades — **never** the transaction pooler 6543, which breaks BEGIN/COMMIT | Agent | ✅ Done 2026-11-04 |
 | P7a | `npm run apply:supabase` migration runner created (`scripts/applySupabaseMigrations.ts`) — dry-run by default, `--apply` to write, verifies RLS afterwards | Agent | ✅ Tool ready (untested against live DB) |

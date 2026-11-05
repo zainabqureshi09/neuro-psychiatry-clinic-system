@@ -27,7 +27,17 @@ export const ReportsScreen: React.FC = () => {
   React.useEffect(() => {
     async function loadReports() {
       try {
-        const res = await fetch('/api/reports');
+        // Express is the single authoritative API. Express now serves
+        // GET /api/reports with the same role gate as the frozen Next handler.
+        const BACKEND_API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
+        const token = typeof window !== 'undefined' ? localStorage.getItem('psychiatrist_token') : null;
+        const headers: Record<string, string> = {};
+        if (token) headers['Authorization'] = `Bearer ${token}`;
+
+        const res = await fetch(`${BACKEND_API}/api/reports`, {
+          headers,
+          credentials: 'include',
+        });
         const json = await res.json();
         if (json.success) {
           setReportData(json.data);

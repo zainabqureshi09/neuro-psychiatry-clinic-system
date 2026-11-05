@@ -13,6 +13,7 @@ import {
   getMonthlyFinancialReport,
 } from "../../lib/db/repositories/billingRepository";
 import { getPatientById } from "../../lib/db/repositories/patientRepository";
+import { getPracticeReport } from "../../lib/db/repositories/reportRepository";
 
 /** Format a fee category for API responses. */
 const formatFeeCategory = (category: any) => ({
@@ -675,6 +676,37 @@ export const getMonthlyCollectionReport = async (
       success: false,
       error: "Internal server error while calculating monthly collections.",
     });
+  }
+};
+
+
+// ==========================================
+// PRACTICE ANALYTICS CONTROLLER
+// ==========================================
+
+/**
+ * GET /api/reports
+ *
+ * Practice analytics aggregates (patient totals, appointment counts, revenue).
+ * Mirrors the Next.js `/api/reports` handler exactly - same repository, same
+ * role gate (ADMIN + DOCTOR) - so the frontend can rely on Express as the
+ * single authoritative API in production without any behaviour change.
+ */
+export const getPracticeReports = async (
+  _req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const report = await getPracticeReport();
+
+    res.status(200).json({
+      success: true,
+      data: report,
+    });
+  } catch (error: any) {
+    logger.error("Error generating practice reports:", error.message || error);
+    next(error);
   }
 };
 
