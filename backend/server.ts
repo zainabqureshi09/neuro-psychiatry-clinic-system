@@ -1,6 +1,10 @@
 import express from "express";
 import cors from "cors";
-import { connectDatabase, disconnectDatabase } from "./config/database";
+import { connectDatabase, disconnectDatabase, loadEnvIfMissing } from "./config/database";
+
+// Ensure environment files (.env.production in prod, .env.local in dev) are loaded
+// before reading ALLOWED_ORIGINS, HOST, or PORT.
+loadEnvIfMissing();
 import { seedDefaultAdmin } from "./config/seedAdmin";
 import healthRoutes from "./routes/healthRoutes";
 import authRoutes from "./routes/authRoutes";

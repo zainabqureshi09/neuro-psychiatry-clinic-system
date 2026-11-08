@@ -1,4 +1,4 @@
-/**
+﻿/**
  * E2E fixture harness - SYNTHETIC data only.
  *
  * Creates dedicated test staff accounts and one synthetic patient for browser
@@ -83,7 +83,7 @@ export async function seedFixtures(): Promise<void> {
 }
 
 export async function cleanupFixtures(): Promise<{ users: number; patients: number }> {
-  const { getPostgresPool } = await import('../lib/db');
+  const { getPostgresPool } = await import('../lib/db/postgres');
   const pool = getPostgresPool();
   if (!pool) throw new Error('No pg pool - DATABASE_URL missing.');
 
@@ -121,7 +121,7 @@ export async function cleanupFixtures(): Promise<{ users: number; patients: numb
 }
 
 export async function statusFixtures(): Promise<void> {
-  const { getPostgresPool } = await import('../lib/db');
+  const { getPostgresPool } = await import('../lib/db/postgres');
   const pool = getPostgresPool()!;
   const emails = E2E_USERS.map((u) => u.email);
   const u = await pool.query('select count(*)::int n from users where email = any($1::text[])', [emails]);
@@ -143,7 +143,7 @@ if (require.main === module) {
       console.log('');
       await statusFixtures();
     }
-    const { closePostgresPool } = await import('../lib/db');
+    const { closePostgresPool } = await import('../lib/db/postgres');
     await closePostgresPool().catch(() => undefined);
   })().catch((e) => {
     console.error('FATAL:', e?.message || e);

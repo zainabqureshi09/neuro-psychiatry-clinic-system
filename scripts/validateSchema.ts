@@ -281,6 +281,35 @@ function runValidation() {
     }
   }
 
+  console.log('\n--- 5. Audit Sequence Migration Verification ---');
+  const seqMigPath = path.join(
+    process.cwd(),
+    'supabase',
+    'migrations',
+    '20261108000001_audit_logs_sequence.sql'
+  );
+  if (!fs.existsSync(seqMigPath)) {
+    totalChecks++;
+    console.error('  ❌ Audit sequence migration file not found: 20261108000001_audit_logs_sequence.sql');
+  } else {
+    const seqMigSql = fs.readFileSync(seqMigPath, 'utf-8');
+    const seqChecks: Array<[string, RegExp]> = [
+      ['Idempotent sequence declaration (CREATE SEQUENCE IF NOT EXISTS public.audit_logs_seq)', /CREATE\s+SEQUENCE\s+IF\s+NOT\s+EXISTS\s+public\.audit_logs_seq/i],
+      ['Forward-only GREATEST synchronization (no rewind)', /GREATEST\s*\(\s*v_seq_last_value\s*,\s*v_max_table_id\s*,\s*8900\s*\)/i],
+      ['Sequence privileges revoked from anon', /REVOKE\s+ALL\s+ON\s+SEQUENCE\s+public\.audit_logs_seq\s+FROM\s+anon/i],
+      ['Sequence privileges revoked from authenticated', /REVOKE\s+ALL\s+ON\s+SEQUENCE\s+public\.audit_logs_seq\s+FROM\s+authenticated/i],
+      ['Sequence USAGE/SELECT/UPDATE granted to service_role', /GRANT\s+USAGE\s*,\s*SELECT\s*,\s*UPDATE\s+ON\s+SEQUENCE\s+public\.audit_logs_seq\s+TO\s+service_role/i],
+    ];
+    for (const [label, pattern] of seqChecks) {
+      totalChecks++;
+      if (pattern.test(seqMigSql)) {
+        console.log(`  ✅ ${label}.`);
+        passedChecks++;
+      } else {
+        console.error(`  ❌ Missing: ${label}.`);
+      }
+    }
+  }
 
   console.log('\n====================================================================');
   console.log(`📊 Validation Summary: ${passedChecks} / ${totalChecks} checks passed (100%)`);

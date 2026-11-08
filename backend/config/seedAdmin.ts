@@ -45,6 +45,109 @@ const PERMISSIONS: Record<string, PermissionMatrix> = {
   },
 };
 
+const INSECURE_PASSWORD_EXACT = new Set([
+  "Admin@123456",
+  "Vance2026!",
+  "Jenkins2026!",
+  "Watson2026!",
+  "Sterling2026!",
+  "admin",
+  "password",
+  "12345678",
+  "123456789012",
+  "changeMe123!",
+]);
+
+const INSECURE_PASSWORD_SUBSTRINGS = [
+  "<generate",
+  "your_",
+  "placeholder",
+  "changeme",
+  "example",
+  "vance2026",
+  "admin@123",
+  "password",
+];
+
+const INSECURE_EMAIL_SUBSTRINGS = [
+  "@vancepsychiatry.com",
+  "admin@clinic.com",
+  "yourclinicdomain.com",
+  "example.com",
+  "<",
+  ">",
+];
+
+/**
+ * Validates that production initial admin credentials are not demo, template,
+ * or weak values before bootstrapping the first ADMIN user.
+ */
+export function validateProductionAdminCredentials(
+  email?: string,
+  password?: string
+): { valid: boolean; reason?: string } {
+  const trimmedEmail = (email || "").trim();
+  const rawPass = password || "";
+
+  if (!trimmedEmail || !rawPass) {
+    return {
+      valid: false,
+      reason: "Both INITIAL_ADMIN_EMAIL and INITIAL_ADMIN_PASSWORD must be provided.",
+    };
+  }
+
+  const lowerEmail = trimmedEmail.toLowerCase();
+  if (
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail) ||
+    INSECURE_EMAIL_SUBSTRINGS.some((marker) => lowerEmail.includes(marker))
+  ) {
+    return {
+      valid: false,
+      reason:
+        "INITIAL_ADMIN_EMAIL must be a valid production email address and cannot use demo or template domains.",
+    };
+  }
+
+  if (rawPass.length < 12) {
+    return {
+      valid: false,
+      reason: "INITIAL_ADMIN_PASSWORD must be at least 12 characters long.",
+    };
+  }
+
+  const lowerPass = rawPass.toLowerCase();
+  if (
+    INSECURE_PASSWORD_EXACT.has(rawPass) ||
+    INSECURE_PASSWORD_SUBSTRINGS.some((marker) => lowerPass.includes(marker)) ||
+    lowerPass === lowerEmail ||
+    lowerPass === lowerEmail.split("@")[0] ||
+    /^(.)\1+$/.test(rawPass)
+  ) {
+    return {
+      valid: false,
+      reason:
+        "INITIAL_ADMIN_PASSWORD cannot use known placeholders, template strings, or match the admin email.",
+    };
+  }
+
+  const categories = [
+    /[A-Z]/.test(rawPass),
+    /[a-z]/.test(rawPass),
+    /[0-9]/.test(rawPass),
+    /[^A-Za-z0-9]/.test(rawPass),
+  ].filter(Boolean).length;
+
+  if (categories < 3) {
+    return {
+      valid: false,
+      reason:
+        "INITIAL_ADMIN_PASSWORD must include at least 3 character classes (uppercase, lowercase, digit, special character).",
+    };
+  }
+
+  return { valid: true };
+}
+
 /**
  * Seeds initial staff accounts if the database contains no users.
  * Passwords are bcrypt-hashed by the user repository (never stored in plaintext).
@@ -57,17 +160,31 @@ export const seedDefaultAdmin = async (): Promise<void> => {
     }
 
     const isProd = process.env.NODE_ENV === "production";
+    const isTest = process.env.NODE_ENV === "test";
+
+    if (isTest) {
+      // In test mode, automated test suites manage synthetic fixtures independently
+      return;
+    }
 
     if (isProd) {
-      const adminEmail = process.env.INITIAL_ADMIN_EMAIL;
+      const adminEmail = process.env.INITIAL_ADMIN_EMAIL?.trim();
       const adminPass = process.env.INITIAL_ADMIN_PASSWORD;
 
-      if (adminEmail && adminPass) {
+      if (adminEmail || adminPass) {
+        const check = validateProductionAdminCredentials(adminEmail, adminPass);
+        if (!check.valid) {
+          logger.error(
+            `FATAL SECURITY ERROR: Refusing to bootstrap production admin account: ${check.reason}`
+          );
+          return;
+        }
+
         await createUser({
           userId: "USR-001",
           name: "Clinic Administrator",
-          email: adminEmail,
-          password: adminPass,
+          email: adminEmail!,
+          password: adminPass!,
           role: "ADMIN",
           title: "System Administrator",
           department: "Administration",

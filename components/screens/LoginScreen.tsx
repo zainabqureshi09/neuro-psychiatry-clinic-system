@@ -6,8 +6,8 @@ import { BrainCircuit, ShieldCheck, Lock, Mail, ArrowRight, Stethoscope, UserChe
 
 export const LoginScreen: React.FC = () => {
   const { login, setActiveScreen } = useApp();
-  const [email, setEmail] = useState('dr.vance@vancepsychiatry.com');
-  const [password, setPassword] = useState('Vance2026!');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [rememberMe, setRememberMe] = useState(true);
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -101,7 +101,7 @@ export const LoginScreen: React.FC = () => {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   className="w-full pl-9 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all"
-                  placeholder="dr.vance@vancepsychiatry.com"
+                  placeholder="doctor@clinic.com"
                 />
               </div>
             </div>
@@ -150,64 +150,66 @@ export const LoginScreen: React.FC = () => {
             </button>
           </form>
 
-          {/* Quick Demo Pre-fill Shortcuts for 4 Roles */}
-          <div className="pt-4 border-t border-slate-100 space-y-2">
-            <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider text-center">
-              Instant Role Presets
-            </p>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setEmail('dr.vance@vancepsychiatry.com');
-                  setPassword('Vance2026!');
-                  login('dr.vance@vancepsychiatry.com', 'Vance2026!');
-                }}
-                className="p-2 bg-blue-50 hover:bg-blue-100/80 border border-blue-200 text-blue-800 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1"
-              >
-                <Stethoscope className="w-3.5 h-3.5" />
-                Doctor
-              </button>
+          {/* Quick Demo Pre-fill Shortcuts for 4 Roles (Development / Test Only) */}
+          {process.env.NODE_ENV !== 'production' && (
+            <div className="pt-4 border-t border-slate-100 space-y-2">
+              <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider text-center">
+                Instant Role Presets
+              </p>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmail('dr.vance@vancepsychiatry.com');
+                    setPassword('Vance2026!');
+                    login('dr.vance@vancepsychiatry.com', 'Vance2026!');
+                  }}
+                  className="p-2 bg-blue-50 hover:bg-blue-100/80 border border-blue-200 text-blue-800 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1"
+                >
+                  <Stethoscope className="w-3.5 h-3.5" />
+                  Doctor
+                </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  setEmail('s.jenkins@vancepsychiatry.com');
-                  setPassword('Jenkins2026!');
-                  login('s.jenkins@vancepsychiatry.com', 'Jenkins2026!');
-                }}
-                className="p-2 bg-teal-50 hover:bg-teal-100/80 border border-teal-200 text-teal-800 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1"
-              >
-                <UserCheck className="w-3.5 h-3.5" />
-                Reception
-              </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmail('s.jenkins@vancepsychiatry.com');
+                    setPassword('Jenkins2026!');
+                    login('s.jenkins@vancepsychiatry.com', 'Jenkins2026!');
+                  }}
+                  className="p-2 bg-teal-50 hover:bg-teal-100/80 border border-teal-200 text-teal-800 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1"
+                >
+                  <UserCheck className="w-3.5 h-3.5" />
+                  Reception
+                </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  setEmail('e.watson@vancepsychiatry.com');
-                  setPassword('Watson2026!');
-                  login('e.watson@vancepsychiatry.com', 'Watson2026!');
-                }}
-                className="p-2 bg-emerald-50 hover:bg-emerald-100/80 border border-emerald-200 text-emerald-800 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1"
-              >
-                Therapist
-              </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmail('e.watson@vancepsychiatry.com');
+                    setPassword('Watson2026!');
+                    login('e.watson@vancepsychiatry.com', 'Watson2026!');
+                  }}
+                  className="p-2 bg-emerald-50 hover:bg-emerald-100/80 border border-emerald-200 text-emerald-800 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1"
+                >
+                  Therapist
+                </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  setEmail('m.sterling@vancepsychiatry.com');
-                  setPassword('Sterling2026!');
-                  login('m.sterling@vancepsychiatry.com', 'Sterling2026!');
-                }}
-                className="p-2 bg-purple-50 hover:bg-purple-100/80 border border-purple-200 text-purple-800 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1"
-              >
-                <ShieldCheck className="w-3.5 h-3.5" />
-                Admin
-              </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmail('m.sterling@vancepsychiatry.com');
+                    setPassword('Sterling2026!');
+                    login('m.sterling@vancepsychiatry.com', 'Sterling2026!');
+                  }}
+                  className="p-2 bg-purple-50 hover:bg-purple-100/80 border border-purple-200 text-purple-800 rounded-lg text-xs font-semibold transition-colors flex items-center justify-center gap-1"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  Admin
+                </button>
+              </div>
             </div>
-          </div>
+          )}
 
           <div className="text-center text-[11px] text-slate-400 flex items-center justify-center gap-1">
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />

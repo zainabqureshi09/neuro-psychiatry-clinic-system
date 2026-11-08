@@ -448,13 +448,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const login = async (email?: string, arg2?: string, arg3?: string): Promise<boolean> => {
     try {
       const BACKEND_API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
-      let targetEmail = email || 'dr.vance@vancepsychiatry.com';
-      let targetPassword = 'Vance2026!';
+      const isProd = process.env.NODE_ENV === 'production';
+      let targetEmail = email || (isProd ? '' : 'dr.vance@vancepsychiatry.com');
+      let targetPassword = isProd ? '' : 'Vance2026!';
 
       if (arg3) {
         targetPassword = arg3;
       } else if (arg2) {
-        if (['ADMIN', 'DOCTOR', 'RECEPTION', 'RECEPTIONIST', 'THERAPIST'].includes(arg2)) {
+        if (!isProd && ['ADMIN', 'DOCTOR', 'RECEPTION', 'RECEPTIONIST', 'THERAPIST'].includes(arg2)) {
           if (arg2 === 'ADMIN') targetEmail = 'm.sterling@vancepsychiatry.com';
           if (arg2 === 'RECEPTION' || arg2 === 'RECEPTIONIST') targetEmail = 's.jenkins@vancepsychiatry.com';
           if (arg2 === 'THERAPIST') targetEmail = 'e.watson@vancepsychiatry.com';
@@ -462,6 +463,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         } else {
           targetPassword = arg2;
         }
+      }
+
+      if (!targetEmail || !targetPassword) {
+        showToast('error', 'Authentication Required', 'Please enter both your email address and password.');
+        return false;
       }
 
       const res = await fetch(`${BACKEND_API}/api/auth/login`, {
@@ -551,6 +557,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const switchRole = (role: UserRole) => {
+    if (process.env.NODE_ENV === 'production') {
+      return;
+    }
     const matchingUser = users.find(u => u.role === role) || {
       ...currentUser,
       role,

@@ -1,4 +1,5 @@
 import { getSupabaseClient } from '../supabase';
+import { getPostgresPool } from '../postgres';
 import { mapAuditLogFromPg } from '../mapper';
 import AuditLog, { IAuditLogDoc } from '@/models/AuditLog';
 
@@ -20,15 +21,77 @@ export interface AuditLogRecord {
   createdAt?: string | Date;
 }
 
+let seqInitPromise: Promise<void> | null = null;
+
+async function ensureAuditLogSequence(): Promise<void> {
+  const pool = getPostgresPool();
+  if (!pool) return;
+  if (!seqInitPromise) {
+    seqInitPromise = (async () => {
+      await pool.query(`
+        SELECT setval(
+          'audit_logs_seq',
+          GREATEST(
+            (SELECT COALESCE(last_value, 8900) FROM pg_sequences WHERE schemaname = 'public' AND sequencename = 'audit_logs_seq'),
+            (SELECT COALESCE(MAX(NULLIF(regexp_replace(log_id, '^LOG-', ''), '')::bigint), 8900) FROM audit_logs WHERE log_id ~ '^LOG-[0-9]+$'),
+            8900
+          ),
+          true
+        );
+      `);
+    })().catch((err) => {
+      seqInitPromise = null;
+      console.warn('[AuditLog] Warning initializing audit_logs_seq:', err.message);
+    });
+  }
+  return seqInitPromise;
+}
+
 export async function generateAuditLogId(): Promise<string> {
-  const supabase = getSupabaseClient();
-  if (supabase) {
-    const { count } = await supabase.from('audit_logs').select('*', { count: 'exact', head: true });
-    return `LOG-${8900 + (count || 0) + 1}`;
+  const pool = getPostgresPool();
+  if (pool) {
+    try {
+      await ensureAuditLogSequence();
+      const res = await pool.query("SELECT nextval('audit_logs_seq') as seq");
+      if (res.rows && res.rows[0]?.seq) {
+        return `LOG-${res.rows[0].seq}`;
+      }
+    } catch (err: any) {
+      console.warn('[AuditLog] Sequence nextval failed, falling back to query:', err.message);
+    }
   }
 
-  const count = await AuditLog.countDocuments();
-  return `LOG-${8900 + count + 1}`;
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    const [{ count }, { data }] = await Promise.all([
+      supabase.from('audit_logs').select('*', { count: 'exact', head: true }),
+      supabase.from('audit_logs').select('log_id').order('created_at', { ascending: false }).limit(50),
+    ]);
+    let maxNum = 8900 + (count || 0);
+    if (data && data.length > 0) {
+      for (const row of data) {
+        const match = typeof row.log_id === 'string' ? row.log_id.match(/^LOG-(\d+)$/) : null;
+        if (match) {
+          const num = parseInt(match[1], 10);
+          if (num > maxNum) maxNum = num;
+        }
+      }
+    }
+    return `LOG-${maxNum + 1}`;
+  }
+
+  try {
+    const last = await AuditLog.findOne({ logId: /^LOG-\d+$/ }).sort({ createdAt: -1 });
+    let maxNum = 8900;
+    if (last && last.logId) {
+      const match = last.logId.match(/^LOG-(\d+)$/);
+      if (match) maxNum = parseInt(match[1], 10);
+    }
+    return `LOG-${maxNum + 1}`;
+  } catch {
+    const count = await AuditLog.countDocuments();
+    return `LOG-${8900 + count + 1}`;
+  }
 }
 
 /**
@@ -46,66 +109,77 @@ export async function recordAuditEvent(event: {
   description: string;
   metadata?: Record<string, any>;
 }): Promise<AuditLogRecord | null> {
-  try {
-    const timestamp = new Date().toISOString();
-    const logId = await generateAuditLogId();
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const timestamp = new Date().toISOString();
+      const logId = await generateAuditLogId();
 
-    const supabase = getSupabaseClient();
-    if (supabase) {
-      const insertRow = {
-        log_id: logId,
+      const supabase = getSupabaseClient();
+      if (supabase) {
+        const insertRow = {
+          log_id: logId,
+          timestamp,
+          user_id: event.userId,
+          user_name: event.userName || 'System',
+          user_role: event.userRole || 'SYSTEM',
+          action: event.action,
+          module: event.module,
+          resource_type: event.resourceType || '',
+          resource_id: event.resourceId || '',
+          patient_ref: event.patientRef || '',
+          description: event.description,
+          metadata: event.metadata || {},
+        };
+
+        const { data, error } = await supabase
+          .from('audit_logs')
+          .insert(insertRow)
+          .select('*')
+          .single();
+
+        if (error) {
+          if (error.code === '23505' && attempt < maxAttempts) {
+            seqInitPromise = null;
+            continue;
+          }
+          console.error('[AuditLog] Notice: could not record audit event:', error.message);
+          return null;
+        }
+        return mapAuditLogFromPg(data);
+      }
+
+      // Fallback: MongoDB
+      const log = new AuditLog({
+        logId,
         timestamp,
-        user_id: event.userId,
-        user_name: event.userName || 'System',
-        user_role: event.userRole || 'SYSTEM',
+        userId: event.userId,
+        userName: event.userName || 'System',
+        userRole: event.userRole || 'SYSTEM',
         action: event.action,
         module: event.module,
-        resource_type: event.resourceType || '',
-        resource_id: event.resourceId || '',
-        patient_ref: event.patientRef || '',
+        resourceType: event.resourceType || '',
+        resourceId: event.resourceId || '',
+        patientRef: event.patientRef || '',
         description: event.description,
         metadata: event.metadata || {},
-      };
+      });
 
-      const { data, error } = await supabase
-        .from('audit_logs')
-        .insert(insertRow)
-        .select('*')
-        .single();
-
-      if (error) {
-        console.error('[AuditLog] Notice: could not record audit event:', error.message);
-        return null;
+      await log.save();
+      const obj: any = log.toObject ? log.toObject() : log;
+      return {
+        ...obj,
+        id: obj.logId || obj._id?.toString(),
+      } as AuditLogRecord;
+    } catch (err: any) {
+      if (err.code === 11000 && attempt < maxAttempts) {
+        continue;
       }
-      return mapAuditLogFromPg(data);
+      console.error('[AuditLog] Non-blocking audit error:', err.message || err);
+      return null;
     }
-
-    // Fallback: MongoDB
-    const log = new AuditLog({
-      logId,
-      timestamp,
-      userId: event.userId,
-      userName: event.userName || 'System',
-      userRole: event.userRole || 'SYSTEM',
-      action: event.action,
-      module: event.module,
-      resourceType: event.resourceType || '',
-      resourceId: event.resourceId || '',
-      patientRef: event.patientRef || '',
-      description: event.description,
-      metadata: event.metadata || {},
-    });
-
-    await log.save();
-    const obj: any = log.toObject ? log.toObject() : log;
-    return {
-      ...obj,
-      id: obj.logId || obj._id?.toString(),
-    } as AuditLogRecord;
-  } catch (err: any) {
-    console.error('[AuditLog] Non-blocking audit error:', err.message || err);
-    return null;
   }
+  return null;
 }
 
 export async function listAuditLogs(filter: {

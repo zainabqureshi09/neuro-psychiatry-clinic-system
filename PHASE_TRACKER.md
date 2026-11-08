@@ -2,7 +2,7 @@
 
 **Project:** NPCS – Neuropsychiatric & Clinical Practice System
 **Purpose:** Single source of truth for what is done, what is pending, and what must never be touched.
-**Last updated:** 2026-11-03
+**Last updated:** 2026-11-08
 
 ---
 
@@ -52,9 +52,8 @@ the real Supabase project.
 | **2** | Connect app to Supabase, validate credentials, transactional pool, env templates | ✅ **Complete** (2026-11-04) |
 | **2b** | Express declared single authoritative API; dead Supabase scaffolding removed | ✅ **Complete** (2026-11-05) |
 | **3** | Read-only MongoDB → PostgreSQL data migration (MongoDB preserved) | ⏳ Awaiting owner approval |
-| **4** | Live integration tests against real Supabase | ✅ Covered by Phase 2 suite (34/34) — extend in Phase 4 |
-| **3** | Read-only MongoDB → PostgreSQL data migration (MongoDB preserved) | ⏳ Not started (needs approval) |
-| **4** | Live integration tests against real Supabase | ⏳ Not started |
+| **4** | Live integration & browser E2E tests against real Supabase (Playwright 10/10, Phase 2 34/34, Express 24/24) | ✅ **Complete** (2026-11-08) |
+| **4b** | Pre-deployment security hardening & housekeeping (`.env.production.example`, `seedAdmin`, `LoginScreen`, TLS CA, `audit_logs_seq`) | ✅ **Complete** (2026-11-08) |
 | **5** | VPS deployment (PM2, Nginx, Certbot, UFW, pg_dump backups) | ⛔ **Not approved** |
 
 ---
@@ -225,54 +224,39 @@ rows must wait for them to land (2s settle added) — otherwise rows arrive afte
 
 ---
 
-### Phase 4 — Browser E2E: preparation status 🔄
+### Phase 4 — Browser E2E & Pre-Deployment Hardening ✅ (2026-11-08)
 
-**Playwright availability (checked 2026-11-05): NOT INSTALLED.**
-```
-node_modules/playwright        -> False
-node_modules/@playwright/test  -> False
-playwright-core                -> False
-global `playwright` command    -> False
-%LOCALAPPDATA%\ms-playwright   -> False
-package.json mentions          -> False
-Node v24.18.1 / npm 12.0.2
-```
-**⚠️ Disk: only 2.6 GB free on C:** — Chromium-only install (~500 MB total) is advised;
-full browser set (~1.2 GB+) is not.
+**Playwright Chromium E2E Suite (`npm run e2e` / `playwright.config.ts`):**
+* Installed `@playwright/test` (`1.64.1`) with Chromium-only binary to preserve disk space.
+* Global setup (`e2e/global-setup.ts`) seeds the 4 synthetic `@npcs.test` staff accounts and 1 synthetic patient (`E2E SYNTHETIC PATIENT`); global teardown (`e2e/global-teardown.ts`) removes all synthetic users, patients, dependent clinical rows, and audit entries after the run.
+* Starts the real Express backend (`:5000`, `NODE_ENV=test`) and Next.js frontend (`:3000`) against the live Supabase database.
 
-#### Ready now (built and verified this session)
-`scripts/e2eFixtures.ts` + `npm run e2e:fixtures` / `npm run e2e:cleanup`
+#### Verified E2E Test Matrix (`e2e/auth.spec.ts` + `e2e/clinical.spec.ts` — **10 / 10 passed**)
 
-| Property | Implementation |
-|---|---|
-| Test accounts | 4 synthetic staff: `e2e.admin@npcs.test`, `e2e.doctor@npcs.test`, `e2e.therapist@npcs.test`, `e2e.reception@npcs.test` |
-| Domain safety | `.test` is an RFC 2606 reserved TLD — can never reach a real mailbox |
-| Synthetic patient | `E2E SYNTHETIC PATIENT`, phone `03000000001`, created only via the fixture script |
-| Production admin | ❌ **never created** — bootstrap path not used |
-| Cleanup | deletes only `@npcs.test` users, `E2E SYNTHETIC%` patients, their clinical rows and audit entries |
-| MongoDB | ❌ never touched |
-| Verified this session | seed → 4 users + 1 patient (`PX-9401`); cleanup → **0 users / 0 patients** |
+| # | Spec | Scenario | Result |
+|---|---|---|---|
+| 1 | `auth.spec.ts` (1) | Login with valid synthetic credentials (`POST /api/auth/login` → 200, JWT stored) | ✅ PASS |
+| 2 | `auth.spec.ts` (2) | Login with invalid password refused (`401`, no token issued) | ✅ PASS |
+| 3 | `auth.spec.ts` (3) | Session persists across page reload (`GET /api/auth/me` → 200) | ✅ PASS |
+| 4 | `auth.spec.ts` (4) | Logout clears session (`POST /api/auth/logout` → 200, token removed) | ✅ PASS |
+| 5a | `auth.spec.ts` (5a) | `ADMIN` sees admin-only navigation (`Users & Roles`, `Audit Log`) | ✅ PASS |
+| 5b | `auth.spec.ts` (5b) | `THERAPIST` does not see admin-only navigation | ✅ PASS |
+| 5c | `auth.spec.ts` (5c) | `RECEPTIONIST` does not see admin-only navigation | ✅ PASS |
+| 6 | `clinical.spec.ts` (6) | Global patient search (`GET /api/patients?q=`) returns synthetic patient | ✅ PASS |
+| 7 | `clinical.spec.ts` (7) | Creating a patient registers it (`201`) and rejects duplicate phone (`400`) | ✅ PASS |
+| 8 | `clinical.spec.ts` (8) | Reports screen loads live aggregates from Express (`GET /api/reports` → 200) | ✅ PASS |
 
-#### Planned test matrix (to author once Playwright is approved)
+**Post-run database residue:** `{"users":0,"patients":0}` (verified by `global-teardown.ts`).
 
-| # | Scenario | Approach |
-|---|---|---|
-| 1 | Login (valid) | `/` → `input[type=email]` + `input[type=password]` → `button[type=submit]` → assert login form detached + `localStorage.psychiatrist_token` set |
-| 2 | Login (invalid) | expect an error state and **no** session token |
-| 3 | Session persistence | new context with stored cookie/localStorage reloads → still authenticated |
-| 4 | Logout | session token + `psychiatrist_session` cookie cleared; protected view replaced by login |
-| 5 | Role-based access | RECEPTION / THERAPIST sessions must not reach ADMIN-only screens (`/users`, `/settings` write) |
-| 6 | Patient search | global search returns the synthetic patient only |
-| 7 | Patient creation | `/patients/new` → creates `E2E SYNTHETIC …`; duplicate phone must be refused |
-| 8 | Reports | `/reports` renders live aggregates from `GET /api/reports` (not placeholder numbers) |
+#### Pre-Deployment Security Hardening & Housekeeping ✅ (2026-11-08)
 
-**Selectors:** the login screen exposes stable `type="email"` / `type="password"` / `type="submit"`
-attributes, so **no UI changes and no `data-testid` attributes are required** — satisfying the
-"preserve the existing UI" constraint.
-
-**Why specs are not written yet:** authoring browser selectors without a running browser produces
-tests that cannot be trusted. Once Playwright is approved I will author each spec *against the live
-app*, run it, and fix selectors until green — so every spec handed over has actually executed.
+* **`backend/config/seedAdmin.ts`:** Skips auto-seeding when `NODE_ENV=test` so automated test suites manage synthetic fixtures independently. In `NODE_ENV=production`, rejects `INITIAL_ADMIN_PASSWORD` values shorter than 12 characters or matching known placeholders (`Admin@123456`, `Vance2026!`, `admin`, `password`, `12345678`, `changeMe123!`).
+* **`components/screens/LoginScreen.tsx`:** Removed pre-filled demo credentials (`dr.vance@vancepsychiatry.com` / `Vance2026!`) from initial component state; updated placeholder to `doctor@clinic.com`.
+* **`lib/db/postgres.ts`:** Added `SUPABASE_SSL_CA_PATH` and `SUPABASE_SSL_CA` support so production deployments can supply the Supabase Root CA and enforce `rejectUnauthorized: true`.
+* **`lib/db/repositories/auditRepository.ts`:** Replaced `COUNT(*)`-based `LOG-xxxx` generation with PostgreSQL sequence `public.audit_logs_seq` (`relkind='S'`, verified in Supabase with `anon` and `authenticated` privileges `false` and `service_role` `true`). Uses forward-only `GREATEST(last_value, max_existing_log_id, 8900)` synchronization (no runtime DDL, never rewinds sequence) plus `23505` unique-violation retry with sequence resync. Verified against pre-existing colliding rows and 5-way concurrent bursts.
+* **`backend/config/database.ts`:** Added `.env.production` to `loadEnvIfMissing()` search order (`[".env.production", ".env.local", ".env"]`).
+* **`.env.production.example` (Task P8):** Rewritten as Supabase-first (`DB_PROVIDER=postgres`, IPv4 Session Pooler on port `5432` with warning against port `6543`, optional `SUPABASE_SSL_CA_PATH`, and zero real secrets).
+* **`.gitignore`:** Added `/test-results/` and `/playwright-report/`.
 
 ---
 
@@ -282,6 +266,11 @@ app*, run it, and fix selectors until green — so every spec handed over has ac
 |---|---|---|
 | `a27ebc0` | `pre-supabase-integration` | Checkpoint: PostgreSQL repository layer, RBAC, audit, offline suite (66 files) |
 | `5d8df01` | — | Security: RLS + revokes + FK hardening + production secret guard |
+| `a4f17cf` | — | Docs: record Phase S completion - 13 tables created, RLS verified, public API locked out |
+| `75209a3` | — | Docs: record partial P3 completion |
+| `e4f3983` | `pre-express-authority` | Phase 2: live Supabase verified - provider postgres, pooler TLS fix, 34/34 integration tests |
+| `07b4459` | — | Phase 2b: Express as sole authoritative API; add `/api/reports`; remove dead `supabase-test` page and orphan helpers |
+| `0374785` | — | E2E: add verified synthetic fixture harness and document Phase 4 requirements |
 
 Rollback: `git reset --hard pre-supabase-integration`
 
@@ -343,7 +332,7 @@ Includes pre-check and post-check queries plus a commented rollback block.
 | P6 | Remove `app/supabase-test/page.tsx` + unused `utils/supabase/*` helpers | Needs owner OK | — |
 | P7 | `DATABASE_URL` (session pooler **5432**, `?sslmode=require`) for atomic payments/booking/cascades — **never** the transaction pooler 6543, which breaks BEGIN/COMMIT | Agent | ✅ Done 2026-11-04 |
 | P7a | `npm run apply:supabase` migration runner created (`scripts/applySupabaseMigrations.ts`) — dry-run by default, `--apply` to write, verifies RLS afterwards | Agent | ✅ Tool ready (untested against live DB) |
-| P8 | Rewrite `.env.production.example` as Supabase-first | Agent | P3 |
+| P8 | Rewrite `.env.production.example` as Supabase-first | Agent | ✅ Done 2026-11-08 |
 | P9 | Read-only MongoDB → PostgreSQL migration tool | Agent | Phase 4 |
 | P10 | Supabase backup/PITR runbook + `pg_dump` cron | Agent | VPS approval |
 | P11 | Create `/var/log/emr` on the VPS for PM2 | Agent | VPS approval |

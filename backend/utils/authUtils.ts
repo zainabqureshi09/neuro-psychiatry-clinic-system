@@ -2,13 +2,27 @@ import { SignJWT, jwtVerify } from "jose";
 import bcrypt from "bcryptjs";
 import { UserRole } from "../../models/User";
 
+const PLACEHOLDER_SECRET_MARKERS = [
+  "psychiatrist_system_secure",
+  "your-32-character",
+  "your_secure",
+  "secure_jwt",
+  "<GENERATE",
+  "placeholder",
+];
+
 const getSecretKey = (): Uint8Array => {
   const isProd = process.env.NODE_ENV === "production";
   const secret = process.env.SESSION_SECRET || process.env.JWT_SECRET;
 
-  if (isProd && (!secret || secret.includes("your-32-character") || secret.includes("secure_jwt"))) {
+  if (
+    isProd &&
+    (!secret ||
+      secret.length < 32 ||
+      PLACEHOLDER_SECRET_MARKERS.some((marker) => secret.includes(marker)))
+  ) {
     throw new Error(
-      "FATAL SECURITY ERROR: In production mode (NODE_ENV=production), a unique SESSION_SECRET or JWT_SECRET must be supplied via environment variables."
+      "FATAL SECURITY ERROR: In production mode (NODE_ENV=production), a unique SESSION_SECRET or JWT_SECRET of at least 32 characters must be supplied via environment variables."
     );
   }
 

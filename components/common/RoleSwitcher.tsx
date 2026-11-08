@@ -7,6 +7,10 @@ import { ShieldCheck, UserCheck, Stethoscope, HeartHandshake } from 'lucide-reac
 export const RoleSwitcher: React.FC = () => {
   const { activeRole, switchRole, currentUser } = useApp();
 
+  if (process.env.NODE_ENV === 'production') {
+    return null;
+  }
+
   return (
     <div className="bg-slate-900 text-white px-4 py-2 border-b border-slate-800 flex items-center justify-between text-xs">
       <div className="flex items-center gap-2">

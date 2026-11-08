@@ -34,16 +34,21 @@ export const sanitizeMessage = (message: string, rawUri?: string): string => {
 };
 
 /**
- * Loads environment variables from .env.local or .env when no database
- * configuration has been provided by the process environment.
+ * Loads environment variables from .env.production (in production) or .env.local/.env
+ * when no database configuration has been provided by the process environment.
  */
-const loadEnvIfMissing = (): void => {
+export const loadEnvIfMissing = (): void => {
   const hasAnyConfig = Boolean(
     process.env.MONGODB_URI || process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
   );
   if (hasAnyConfig) return;
 
-  for (const envFile of [".env.local", ".env"]) {
+  const envFiles =
+    process.env.NODE_ENV === "production"
+      ? [".env.production", ".env"]
+      : [".env.local", ".env"];
+
+  for (const envFile of envFiles) {
     const envPath = path.resolve(process.cwd(), envFile);
     if (fs.existsSync(envPath)) {
       try {

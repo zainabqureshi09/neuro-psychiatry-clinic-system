@@ -6,7 +6,14 @@ import { UserRole } from '@/models/User';
 const COOKIE_NAME = 'psychiatrist_session';
 
 /** Insecure placeholder secrets that must never be accepted in production. */
-const PLACEHOLDER_SECRET_MARKERS = ['psychiatrist_system_secure', 'your-32-character', 'your_secure'];
+const PLACEHOLDER_SECRET_MARKERS = [
+  'psychiatrist_system_secure',
+  'your-32-character',
+  'your_secure',
+  'secure_jwt',
+  '<GENERATE',
+  'placeholder',
+];
 
 /**
  * Resolves the signing secret lazily so that tests and runtime environment
