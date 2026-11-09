@@ -24,6 +24,7 @@ import { logger } from "./utils/logger";
 import { getHealthStatus } from "./controllers/healthController";
 
 const app = express();
+app.set("trust proxy", 1);
 
 // Apply security response headers across all HTTP requests
 app.use(securityHeaders);
@@ -79,7 +80,7 @@ app.use(notFoundHandler);
 app.use(errorHandler);
 
 // Environment Configuration
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST = process.env.HOST || (process.env.NODE_ENV === "production" ? "127.0.0.1" : "0.0.0.0");
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 5000;
 
 let server: ReturnType<typeof app.listen> | null = null;
