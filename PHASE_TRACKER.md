@@ -266,11 +266,11 @@ rows must wait for them to land (2s settle added) — otherwise rows arrive afte
 |---|---|---|
 | `a27ebc0` | `pre-supabase-integration` | Checkpoint: PostgreSQL repository layer, RBAC, audit, offline suite (66 files) |
 | `5d8df01` | — | Security: RLS + revokes + FK hardening + production secret guard |
-| `a4f17cf` | — | Docs: record Phase S completion - 13 tables created, RLS verified, public API locked out |
-| `75209a3` | — | Docs: record partial P3 completion |
-| `e4f3983` | `pre-express-authority` | Phase 2: live Supabase verified - provider postgres, pooler TLS fix, 34/34 integration tests |
-| `07b4459` | — | Phase 2b: Express as sole authoritative API; add `/api/reports`; remove dead `supabase-test` page and orphan helpers |
-| `0374785` | — | E2E: add verified synthetic fixture harness and document Phase 4 requirements |
+| `cb356bf` | — | Docs: record Phase S completion - 13 tables created, RLS verified, public API locked out |
+| `5dab99e` | — | Docs: record partial P3 completion |
+| `05a4a99` | `pre-express-authority` | Phase 2: live Supabase verified - provider postgres, pooler TLS fix, 34/34 integration tests |
+| `0668312` | — | Phase 2b: Express as sole authoritative API; add `/api/reports`; remove dead `supabase-test` page and orphan helpers |
+| `7ea37b2` | — | E2E: add verified synthetic fixture harness and document Phase 4 requirements |
 
 Rollback: `git reset --hard pre-supabase-integration`
 
